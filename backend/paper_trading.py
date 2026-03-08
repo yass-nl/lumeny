@@ -198,21 +198,12 @@ async def _run_inference(buf) -> tuple[dict, dict]:
 
 async def log_predictions(buf):
     """Fetch predictions for all pairs and log them to the database."""
-    # Guard: only predict if the last complete 1H candle is the current hour.
-    # i.e. last_candle_time == floor(now, 1H) - 1H (the just-closed bar).
-    # If it's older, the market is closed (weekend/holiday) — skip.
+    # Guard: skip during weekend market closure.
+    # Market closed: all day Saturday, Sunday before 21:00 UTC (Sydney open).
     now = datetime.now(timezone.utc)
-    current_hour_floor = now.replace(minute=0, second=0, microsecond=0)
-    expected_last_candle = current_hour_floor - timedelta(hours=1)
-
-    sample_ohlcv = buf.get_ohlcv('EURUSD')
-    if sample_ohlcv and '1H' in sample_ohlcv and not sample_ohlcv['1H'].empty:
-        last_candle = sample_ohlcv['1H'].index[-1].to_pydatetime()
-        if last_candle.tzinfo is None:
-            last_candle = last_candle.replace(tzinfo=timezone.utc)
-        if last_candle < expected_last_candle:
-            logger.info(f'Last candle {last_candle} is stale (expected {expected_last_candle}) — market closed, skipping inference.')
-            return 0
+    if now.weekday() == 5 or (now.weekday() == 6 and now.hour < 21):
+        logger.info(f'Market closed (weekend) — skipping inference.')
+        return 0
 
     logger.info('Running inference...')
     predictions, prices = await _run_inference(buf)
@@ -608,8 +599,13 @@ async def run_loop():
         except Exception as e:
             logger.error(f'Loop error: {e}', exc_info=True)
 
-        logger.info('Sleeping 60 minutes...')
-        await asyncio.sleep(60 * 60)
+        # Sleep until XX:05 of the next hour to ensure cycle always starts
+        # within the first few minutes of a new candle period.
+        now = datetime.now(timezone.utc)
+        next_run = (now + timedelta(hours=1)).replace(minute=5, second=0, microsecond=0)
+        sleep_secs = (next_run - now).total_seconds()
+        logger.info(f'Sleeping until {next_run.strftime("%H:%M")} UTC ({sleep_secs/60:.1f} min)...')
+        await asyncio.sleep(sleep_secs)
 
 
 # ── Monitoring API ────────────────────────────────────────────────────────────
