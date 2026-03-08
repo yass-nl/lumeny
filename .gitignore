@@ -1,0 +1,46 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Dotenv
+.env
+
+# Backend — models & data (too large for git)
+backend/models/
+backend/data/
+backend/__pycache__/
+backend/*.db
+*.pyc
+*.parquet
+*.csv
+*.joblib
+
+# Notebooks checkpoints
+notebooks/.ipynb_checkpoints/
+
+backend/models_2/
+backend/models_3/
+
+notebooks_2/.ipynb_checkpoints/
+notebooks_3/.ipynb_checkpoints/

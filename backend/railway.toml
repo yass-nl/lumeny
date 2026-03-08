@@ -1,0 +1,2 @@
+[deploy]
+startCommand = "python download_models.py && python paper_trading.py run"

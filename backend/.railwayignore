@@ -1,0 +1,8 @@
+models/
+data/
+__pycache__/
+*.pyc
+*.parquet
+*.csv
+*.joblib
+.env
