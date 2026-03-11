@@ -101,11 +101,15 @@ class CandleBuffer:
         Load enough historical data to compute all features.
         Fetches 5m, 15m, 1H from Polygon REST directly.
         4H and 1D are resampled from 1H (Polygon's native 4H/1D aggs can be stale).
-        Drops the last candle of each timeframe to avoid incomplete bars.
+        Drops any bar whose period hasn't fully closed yet (based on current UTC time).
         """
         logger.info('Initializing candle buffers from Polygon REST...')
 
-        to_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        now = datetime.now(timezone.utc)
+        to_date = now.strftime('%Y-%m-%d')
+
+        # Bar durations in minutes for each fetched timeframe
+        tf_durations_min = {'5m': 5, '15m': 15, '1H': 60}
 
         # Fetch config — only sub-1H and 1H; 4H/1D resampled from 1H
         tf_fetch_config = {
@@ -119,15 +123,19 @@ class CandleBuffer:
             self.buffers[pair] = {}
 
             for tf_name, (multiplier, timespan, lookback_days) in tf_fetch_config.items():
-                from_date = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+                from_date = (now - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
                 await asyncio.sleep(0.3)  # avoid Polygon rate limit
                 try:
                     df = await fetch_historical_bars(pair, multiplier, timespan, from_date, to_date)
                     if not df.empty:
-                        df = df[df.index.dayofweek < 5]
-                        # Drop last candle — it may be incomplete (still open)
-                        if len(df) > 1:
-                            df = df.iloc[:-1]
+                        # Filter out weekend market closure: Sat all day + Sun before 21:00 UTC
+                        df = df[~((df.index.dayofweek == 5) |
+                                  ((df.index.dayofweek == 6) & (df.index.hour < 21)))]
+                        # Drop bars that haven't fully closed yet.
+                        # A bar starting at T is complete when now >= T + bar_duration.
+                        bar_dur = timedelta(minutes=tf_durations_min[tf_name])
+                        now_naive = now.replace(tzinfo=None)  # index is tz-naive
+                        df = df[df.index + bar_dur <= now_naive]
                         self.buffers[pair][tf_name] = df
                         logger.info(f'    {pair} {tf_name}: {len(df)} candles ({df.index[0].date()} to {df.index[-1].date()})')
                     else:
@@ -135,9 +143,11 @@ class CandleBuffer:
                 except Exception as e:
                     logger.warning(f'    {pair} {tf_name} error: {e}')
 
-            # Resample 4H and 1D from 1H — ensures fresh data up to latest closed candle.
-            # No iloc[:-1] here: the 1H buffer already had its last (incomplete) bar dropped,
-            # so all resampled bars are built from complete 1H data and are fully valid.
+            # Resample 4H and 1D from 1H.
+            # The 1H buffer only contains fully-closed bars, so resampled bars
+            # built entirely from closed 1H bars are also valid.  However the
+            # trailing resampled bar may be *partial* (e.g. a 4H bar built from
+            # only 1-3 hours), so callers should trim 4H/1D before using.
             if '1H' in self.buffers[pair] and not self.buffers[pair]['1H'].empty:
                 df_1h = self.buffers[pair]['1H']
                 for tf_name, rule in [('4H', '4h'), ('1D', '1D')]:

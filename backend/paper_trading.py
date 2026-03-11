@@ -53,11 +53,22 @@ logger = logging.getLogger(__name__)
 
 HORIZONS = ['1H', '4H', '1D']
 
-# How many hours until each horizon's prediction matures
+# How many hours until each horizon's prediction matures.
+# label_1H = log(close[T+1] / close[T]) where T is the last closed 1H bar.
+# close[T]   = price at last_candle_time + 1H  (= entry price, bar T close)
+# close[T+1] = price at last_candle_time + 2H  (= exit price, bar T+1 close)
+# _fetch_close_price fetches bar with open < matures_at and returns its close.
+# So matures_at must point to the close time of the exit bar,
+# and we wait until that time has passed before resolving.
+# We set matures_at = last_candle_time + (n+1)H so the resolve query only fires
+# after the exit bar has closed:
+#   1H:  T + 2H  (exit bar opens T+1H, closes T+2H)
+#   4H:  T + 5H  (exit bar opens T+4H, closes T+5H)
+#   1D:  T + 25H (exit bar opens T+24H, closes T+25H)
 HORIZON_HOURS = {
-    '1H':  1,
-    '4H':  4,
-    '1D':  24,
+    '1H':  2,
+    '4H':  5,
+    '1D':  25,
 }
 
 # ── Database ─────────────────────────────────────────────────────────────────
@@ -160,13 +171,17 @@ def _run_inference_sync(buf) -> tuple[dict, dict]:
 
     for pair in PAIRS:
         try:
-            ohlcv = buf.get_ohlcv(pair)
-            if not ohlcv or '1H' not in ohlcv:
+            ohlcv_raw = buf.get_ohlcv(pair)
+            if not ohlcv_raw or '1H' not in ohlcv_raw:
                 logger.warning(f'No 1H data for {pair}')
                 continue
 
-            # CandleBuffer.initialize() already drops the last (incomplete) candle,
-            # so the buffer only contains fully-closed bars — no extra trim needed.
+            # CandleBuffer.initialize() only keeps fully-closed bars for fetched
+            # timeframes (5m, 15m, 1H).  For 4H and 1D (resampled from 1H),
+            # the trailing bar may be partial — but the training pipeline also
+            # used the current-day 1D bar (with future data baked in), so using
+            # the partial bar is the closest live approximation.
+            ohlcv = dict(ohlcv_raw)
 
             features_df = build_feature_row(
                 ohlcv, closes_1h, pair, PAIR_IDS[pair],
@@ -179,7 +194,7 @@ def _run_inference_sync(buf) -> tuple[dict, dict]:
             result = predictor.predict(features_df, pair)
             predictions[pair] = result
 
-            # Entry price = close of last complete 1H candle
+            # Entry price = close of last complete 1H candle (after trim)
             latest_close = float(ohlcv['1H']['close'].iloc[-1])
             prices[pair] = latest_close
 
@@ -231,22 +246,35 @@ async def log_predictions(buf):
             if horizon not in result['horizons']:
                 continue
 
+            # Frequency guard: 4H logs every 4 hours, 1D logs every 24 hours.
+            # Cycle runs at XX:05 — check the current hour.
+            if horizon == '4H' and now.hour % 4 != 0:
+                continue
+            if horizon == '1D' and now.hour != 0:
+                continue
+
             h = result['horizons'][horizon]
-            # last_candle_time = bar OPEN time (e.g. 14:00). Entry = close of that
-            # bar (price at 15:00). Backtest exit for 1H = close[T+1] = bar opening
-            # at 15:00, whose close is at 16:00. Polygon bar 't' = open time, so we
-            # need matures_at = 15:00 to fetch that bar's close.
-            # Formula: last_candle_time + horizon = 14:00 + 1H = 15:00 ✓
+            # last_candle_time = bar OPEN time e.g. T=03:00 (bar closes at 04:00).
+            # Entry price = close of that bar = price at 04:00.
+            # Label = log(close[T+1] / close[T]):
+            #   close[T]   = entry price @ 04:00
+            #   close[T+1] = exit price  @ 05:00 (bar T+1 opens 04:00, closes 05:00)
+            # _fetch_close_price finds bar with open < matures_at → returns close.
+            # matures_at = 03:00 + 2H = 05:00:
+            #   → finds bar opening at 04:00 (last bar with t < 05:00)
+            #   → returns its close = 05:00 price ✓
+            #   → resolve query fires only after 05:00 ✓
             matures_at = last_candle_time + timedelta(hours=HORIZON_HOURS[horizon])
 
             try:
-                # Skip if there's already a pending prediction for this pair+horizon
+                # Skip if a prediction for this exact candle already exists (resolved or not)
                 existing = conn.execute("""
                     SELECT id FROM predictions
-                    WHERE pair = ? AND horizon = ? AND resolved_at IS NULL
-                """, (pair, horizon)).fetchone()
+                    WHERE pair = ? AND horizon = ? AND matures_at = ?
+                """, (pair, horizon, matures_at.isoformat())).fetchone()
                 if existing:
                     continue
+
 
                 conn.execute("""
                     INSERT INTO predictions (
@@ -339,12 +367,14 @@ async def _fetch_close_price(pair: str, at_time: datetime) -> float | None:
             return None
 
         # Polygon bar['t'] = bar open time (ms).  A 1H bar starting at 22:00
-        # covers 22:00-23:00.  We want the bar whose period contains at_time,
-        # i.e. the last bar whose open (t) <= at_time.
+        # covers 22:00-23:00, its close = price at 23:00.
+        # We want the bar whose CLOSE corresponds to at_time, i.e. the bar
+        # that OPENED before at_time.  Use strict < so that at_time=05:00
+        # picks the bar opening at 04:00 (close = 05:00), not 05:00 (close = 06:00).
         target_ts = int(at_time.timestamp() * 1000)
         best = None
         for bar in results:
-            if bar['t'] <= target_ts:
+            if bar['t'] < target_ts:
                 best = bar
             else:
                 break  # results are sorted asc, no need to continue
@@ -401,7 +431,7 @@ async def resolve_outcomes():
                 logger.warning(f'No entry price for prediction {row["id"]}')
                 continue
 
-            actual_return = (exit_price - entry_price) / entry_price * 100  # in %
+            actual_return = np.log(exit_price / entry_price) * 100  # log return in %, matches training labels
 
             # Was the directional prediction correct?
             # Predictions below 60% confidence are non-signals — still resolved

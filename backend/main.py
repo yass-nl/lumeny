@@ -122,8 +122,10 @@ async def _run_predictions_all():
                 logger.warning(f'No 1H data for {pair}, skipping prediction.')
                 continue
 
-            # Drop the last candle from each timeframe — it may be incomplete
-            # (partially formed via WebSocket). Training only used fully-closed candles.
+            # Drop the last candle from each timeframe — it may be incomplete.
+            # After WebSocket starts, the buffer can contain partially-formed bars
+            # from live minute aggregates.  Trimming ensures only fully-closed bars
+            # are used for feature computation.
             ohlcv = {}
             for tf, df in ohlcv_raw.items():
                 ohlcv[tf] = df.iloc[:-1] if len(df) > 1 else df
