@@ -1,6 +1,8 @@
 """
 Download models from Cloudflare R2 (private bucket) to the local volume.
 Runs once at container startup if models are not already present.
+
+v5.1: 3 quantile models (Q25/Q50/Q75) + 1 meta-model.
 """
 
 import os
@@ -10,12 +12,10 @@ from pathlib import Path
 MODELS_DIR = Path("/app/models")
 
 FILES = [
-    "model_1H_Q10.joblib", "model_1H_Q25.joblib", "model_1H_Q50.joblib",
-    "model_1H_Q75.joblib", "model_1H_Q90.joblib",
-    "model_4H_Q10.joblib", "model_4H_Q25.joblib", "model_4H_Q50.joblib",
-    "model_4H_Q75.joblib", "model_4H_Q90.joblib",
-    "model_1D_Q10.joblib", "model_1D_Q25.joblib", "model_1D_Q50.joblib",
-    "model_1D_Q75.joblib", "model_1D_Q90.joblib",
+    "model_1H_Q25.joblib",
+    "model_1H_Q50.joblib",
+    "model_1H_Q75.joblib",
+    "meta_confidence.joblib",
 ]
 
 
@@ -42,7 +42,7 @@ def download():
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    for fname in FILES:
+    for fname in missing:
         dest = MODELS_DIR / fname
         print(f"Downloading {fname}...")
         s3.download_file(bucket, fname, str(dest))

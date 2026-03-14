@@ -1,7 +1,10 @@
 """
-Data service — fetches OHLCV from Polygon/Massive REST API,
-maintains in-memory candle buffers for feature computation,
+Data service v5.1 — fetches OHLCV from Polygon REST API,
+maintains in-memory candle buffers for microstructure feature computation,
 and provides the real-time WebSocket price relay.
+
+Fetches 1m, 5m, 15m, 1H data.  1m/5m/15m are used for feature computation.
+1H is used for entry/exit prices and resolution.
 """
 
 import os
@@ -14,7 +17,7 @@ import numpy as np
 import pandas as pd
 import websockets
 
-from features import PAIRS, TIMEFRAMES_RESAMPLE, resample_ohlcv
+from features import PAIRS, resample_ohlcv
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +72,7 @@ async def fetch_historical_bars(
         except Exception as e:
             if attempt < retries - 1:
                 wait = 2 ** attempt  # 1s, 2s
-                logger.warning(f'fetch_historical_bars {pair} {timespan} attempt {attempt + 1} failed: {e!r} — retrying in {wait}s')
+                logger.warning(f'fetch_historical_bars {pair} {timespan} attempt {attempt + 1} failed: {e!r} -- retrying in {wait}s')
                 await asyncio.sleep(wait)
             else:
                 raise
@@ -88,7 +91,11 @@ async def fetch_historical_bars(
 class CandleBuffer:
     """
     Maintains in-memory OHLCV buffers for all pairs and timeframes.
-    Provides the data needed for feature computation.
+    Provides the data needed for microstructure feature computation.
+
+    Fetches: 1m (3 days), 5m (3 days), 15m (7 days), 1H (30 days).
+    1m/5m/15m are needed for compute_features_for_pair().
+    1H is needed for entry/exit price references and resolution.
     """
 
     def __init__(self):
@@ -98,10 +105,9 @@ class CandleBuffer:
 
     async def initialize(self):
         """
-        Load enough historical data to compute all features.
-        Fetches 5m, 15m, 1H from Polygon REST directly.
-        4H and 1D are resampled from 1H (Polygon's native 4H/1D aggs can be stale).
-        Drops any bar whose period hasn't fully closed yet (based on current UTC time).
+        Load enough historical data to compute microstructure features.
+        Fetches 1m, 5m, 15m from Polygon REST directly.
+        1H fetched for entry/exit price lookup (not needed for features).
         """
         logger.info('Initializing candle buffers from Polygon REST...')
 
@@ -109,13 +115,18 @@ class CandleBuffer:
         to_date = now.strftime('%Y-%m-%d')
 
         # Bar durations in minutes for each fetched timeframe
-        tf_durations_min = {'5m': 5, '15m': 15, '1H': 60}
+        tf_durations_min = {'1m': 1, '5m': 5, '15m': 15, '1H': 60}
 
-        # Fetch config — only sub-1H and 1H; 4H/1D resampled from 1H
+        # Fetch config: timeframe -> (multiplier, timespan, lookback_days)
+        # 1m: 3 days gives ~60*24*3 = ~4320 bars (enough for warmup + current)
+        # 5m: 3 days gives ~12*24*3 = ~864 bars
+        # 15m: 7 days gives ~4*24*7 = ~672 bars
+        # 1H: 30 days gives ~24*30 = ~720 bars (for price lookup / resolution)
         tf_fetch_config = {
-            '5m':  (5,   'minute', 3),     # 300 bars × 5min = ~1 day  → fetch 3 days
-            '15m': (15,  'minute', 7),     # 300 bars × 15min = ~3 days → fetch 7 days
-            '1H':  (1,   'hour',   850),   # Need 850 days of 1H to resample 200+ bars of 1D
+            '1m':  (1,   'minute', 3),
+            '5m':  (5,   'minute', 3),
+            '15m': (15,  'minute', 7),
+            '1H':  (1,   'hour',   30),
         }
 
         for pair in PAIRS:
@@ -132,9 +143,8 @@ class CandleBuffer:
                         df = df[~((df.index.dayofweek == 5) |
                                   ((df.index.dayofweek == 6) & (df.index.hour < 21)))]
                         # Drop bars that haven't fully closed yet.
-                        # A bar starting at T is complete when now >= T + bar_duration.
                         bar_dur = timedelta(minutes=tf_durations_min[tf_name])
-                        now_naive = now.replace(tzinfo=None)  # index is tz-naive
+                        now_naive = now.replace(tzinfo=None)
                         df = df[df.index + bar_dur <= now_naive]
                         self.buffers[pair][tf_name] = df
                         logger.info(f'    {pair} {tf_name}: {len(df)} candles ({df.index[0].date()} to {df.index[-1].date()})')
@@ -143,22 +153,6 @@ class CandleBuffer:
                 except Exception as e:
                     logger.warning(f'    {pair} {tf_name} error: {e}')
 
-            # Resample 4H and 1D from 1H.
-            # The 1H buffer only contains fully-closed bars, so resampled bars
-            # built entirely from closed 1H bars are also valid.  However the
-            # trailing resampled bar may be *partial* (e.g. a 4H bar built from
-            # only 1-3 hours), so callers should trim 4H/1D before using.
-            if '1H' in self.buffers[pair] and not self.buffers[pair]['1H'].empty:
-                df_1h = self.buffers[pair]['1H']
-                for tf_name, rule in [('4H', '4h'), ('1D', '1D')]:
-                    try:
-                        df_resampled = resample_ohlcv(df_1h, rule)
-                        if not df_resampled.empty:
-                            self.buffers[pair][tf_name] = df_resampled
-                            logger.info(f'    {pair} {tf_name}: {len(df_resampled)} candles (resampled from 1H)')
-                    except Exception as e:
-                        logger.warning(f'    {pair} {tf_name} resample error: {e}')
-
         self._initialized = True
         logger.info('Candle buffers initialized.')
 
@@ -166,20 +160,12 @@ class CandleBuffer:
         """Get all timeframe buffers for a pair."""
         return self.buffers.get(pair, {})
 
-    def get_all_1h_closes(self) -> dict[str, pd.Series]:
-        """Get 1H close prices for all pairs (for cross-pair correlations)."""
-        closes = {}
-        for pair in PAIRS:
-            if pair in self.buffers and '1H' in self.buffers[pair]:
-                closes[pair] = self.buffers[pair]['1H']['close']
-        return closes
-
     def get_latest_price(self, pair: str) -> dict | None:
         """Get the latest available price for a pair."""
         if pair not in self.buffers:
             return None
         # Use the finest available timeframe
-        for tf in ['5m', '15m', '1H']:
+        for tf in ['1m', '5m', '15m', '1H']:
             if tf in self.buffers[pair] and not self.buffers[pair][tf].empty:
                 row = self.buffers[pair][tf].iloc[-1]
                 return {
@@ -194,28 +180,33 @@ class CandleBuffer:
         return None
 
     def append_candle(self, pair: str, candle: dict):
-        """Append a new 1-min candle from WebSocket and update resampled buffers."""
+        """Append a new 1-min candle from WebSocket and update higher TF buffers."""
         if pair not in self.buffers:
             return
 
         ts = pd.Timestamp(candle['timestamp'])
-        row = pd.DataFrame([{
+        row_data = {
             'open': candle['open'],
             'high': candle['high'],
             'low': candle['low'],
             'close': candle['close'],
             'volume': candle.get('volume', 0),
-        }], index=[ts])
+        }
+        new_row = pd.DataFrame([row_data], index=[ts])
 
-        # Append to 5m buffer by updating the last candle or adding new
-        for tf_name, tf_rule in TIMEFRAMES_RESAMPLE.items():
+        # Append to 1m buffer directly
+        if '1m' in self.buffers[pair]:
+            self.buffers[pair]['1m'] = pd.concat([self.buffers[pair]['1m'], new_row])
+
+        # Update higher TF buffers by aggregating the new 1m candle
+        tf_rules = {'5m': '5min', '15m': '15min', '1H': '1h'}
+        for tf_name, tf_rule in tf_rules.items():
             if tf_name not in self.buffers[pair]:
                 continue
             buf = self.buffers[pair][tf_name]
             if not buf.empty:
-                last_ts = buf.index[-1]
-                # Check if this candle belongs to the current bar
                 resampled_ts = ts.floor(tf_rule)
+                last_ts = buf.index[-1]
                 if resampled_ts == last_ts:
                     # Update the current bar
                     buf.loc[last_ts, 'high'] = max(buf.loc[last_ts, 'high'], candle['high'])
@@ -224,14 +215,8 @@ class CandleBuffer:
                     buf.loc[last_ts, 'volume'] += candle.get('volume', 0)
                 elif resampled_ts > last_ts:
                     # New bar
-                    new_row = pd.DataFrame([{
-                        'open': candle['open'],
-                        'high': candle['high'],
-                        'low': candle['low'],
-                        'close': candle['close'],
-                        'volume': candle.get('volume', 0),
-                    }], index=[resampled_ts])
-                    self.buffers[pair][tf_name] = pd.concat([buf, new_row])
+                    new_tf_row = pd.DataFrame([row_data], index=[resampled_ts])
+                    self.buffers[pair][tf_name] = pd.concat([buf, new_tf_row])
 
 
 class PriceFeed:
@@ -266,7 +251,6 @@ class PriceFeed:
                     logger.info(f'WS auth: {msg}')
 
                     # Subscribe to minute aggregates for all pairs
-                    # CA.* = forex minute aggregates
                     subs = ','.join(f'CA.{POLYGON_TICKERS[p]}' for p in PAIRS)
                     await ws.send(json.dumps({'action': 'subscribe', 'params': subs}))
                     msg = await ws.recv()
@@ -291,7 +275,6 @@ class PriceFeed:
 
     async def _handle_aggregate(self, event: dict):
         """Process a minute aggregate event from Polygon."""
-        # event: {ev, sym, o, c, h, l, v, s, e, ...}
         sym = event.get('sym', '')  # e.g. "C:EUR-USD"
         pair_raw = sym.replace('C:', '').replace('-', '')  # -> "EURUSD"
 

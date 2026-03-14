@@ -1,18 +1,18 @@
 """
-LumenY — Paper Trading Tracker
+LumenY -- Paper Trading Tracker v5.1
+
+Single horizon (4H forward), per-pair cooldown, meta-model filtering.
 
 Two jobs:
-  1. log_predictions()  — runs every hour, logs model predictions to SQLite
-  2. resolve_outcomes() — runs every hour, checks past predictions and records actual outcomes
+  1. log_predictions()  -- runs every hour, logs model predictions to SQLite
+  2. resolve_outcomes() -- runs every hour, checks past predictions and records actual outcomes
 
 Usage:
-  python paper_trading.py log      → log predictions right now
-  python paper_trading.py resolve  → resolve any mature predictions
-  python paper_trading.py report   → print calibration report
-  python paper_trading.py run      → run both jobs in a loop (every hour)
-
-Setup (run once):
-  python paper_trading.py setup
+  python paper_trading.py setup    -- create DB tables
+  python paper_trading.py log      -- log predictions right now
+  python paper_trading.py resolve  -- resolve any mature predictions
+  python paper_trading.py report   -- print calibration report
+  python paper_trading.py run      -- run both jobs in a loop (every hour)
 """
 
 import argparse
@@ -30,14 +30,14 @@ import pandas as pd
 
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
-# ── Paths ────────────────────────────────────────────────────────────────────
+# -- Paths --
 
 BACKEND_DIR  = Path(__file__).parent
 VOLUME_DIR   = Path(os.environ.get('VOLUME_PATH', str(BACKEND_DIR)))
 DB_PATH      = VOLUME_DIR / 'paper_trading.db'
 LOG_PATH     = BACKEND_DIR / 'paper_trading.log'
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# -- Logging --
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,29 +49,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# -- Constants --
 
-HORIZONS = ['1H', '4H', '1D']
+# Entry = 1H close at prediction time (bar T).
+# Exit  = 1H close 4 hours later (bar T+4).
+# matures_at = last_candle_time + 5H (so resolve fires after exit bar closes).
+MATURITY_HOURS = 5
 
-# How many hours until each horizon's prediction matures.
-# label_1H = log(close[T+1] / close[T]) where T is the last closed 1H bar.
-# close[T]   = price at last_candle_time + 1H  (= entry price, bar T close)
-# close[T+1] = price at last_candle_time + 2H  (= exit price, bar T+1 close)
-# _fetch_close_price fetches bar with open < matures_at and returns its close.
-# So matures_at must point to the close time of the exit bar,
-# and we wait until that time has passed before resolving.
-# We set matures_at = last_candle_time + (n+1)H so the resolve query only fires
-# after the exit bar has closed:
-#   1H:  T + 2H  (exit bar opens T+1H, closes T+2H)
-#   4H:  T + 5H  (exit bar opens T+4H, closes T+5H)
-#   1D:  T + 25H (exit bar opens T+24H, closes T+25H)
-HORIZON_HOURS = {
-    '1H':  2,
-    '4H':  5,
-    '1D':  25,
-}
+# Per-pair cooldown: once a trade is logged for a pair, skip that pair for 4 hours.
+COOLDOWN_HOURS = 4
 
-# ── Database ─────────────────────────────────────────────────────────────────
+AVG_SPREAD = 0.00028
+
+
+# -- Database --
 
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -85,45 +76,33 @@ def setup_db():
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS predictions (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            logged_at        TEXT NOT NULL,          -- UTC ISO timestamp when logged
+            logged_at        TEXT NOT NULL,
             pair             TEXT NOT NULL,
-            horizon          TEXT NOT NULL,
-            direction        TEXT NOT NULL,          -- bullish / bearish / neutral
-            probability      REAL NOT NULL,          -- calibrated dominant probability
-            p_down           REAL NOT NULL,          -- calibrated P(down)
-            p_up             REAL NOT NULL,          -- calibrated P(up)
-            raw_p_down       REAL NOT NULL,
-            signal_strength  TEXT NOT NULL,
-            expected_move    REAL NOT NULL,          -- Q50 in %
-            q10              REAL NOT NULL,
+            direction        TEXT NOT NULL,
             q25              REAL NOT NULL,
             q50              REAL NOT NULL,
             q75              REAL NOT NULL,
-            q90              REAL NOT NULL,
-            cone_inner_low   REAL NOT NULL,
-            cone_inner_high  REAL NOT NULL,
-            cone_outer_low   REAL NOT NULL,
-            cone_outer_high  REAL NOT NULL,
-            low_conviction   INTEGER NOT NULL,       -- 0/1
-            quantile_spread  REAL NOT NULL,
-            entry_price      REAL,                   -- price at time of prediction
-            matures_at       TEXT NOT NULL,          -- UTC ISO timestamp when to resolve
-            -- Filled in after resolution:
+            meta_proba       REAL NOT NULL,
+            is_tradeable     INTEGER NOT NULL,
+            entry_price      REAL,
+            matures_at       TEXT NOT NULL,
             resolved_at      TEXT,
             exit_price       REAL,
-            actual_return    REAL,                   -- log return at horizon
-            correct          INTEGER,                -- 1 if direction was right, 0 if not
+            actual_return    REAL,
+            correct          INTEGER,
             notes            TEXT
         );
 
-        CREATE INDEX IF NOT EXISTS idx_matures_at   ON predictions(matures_at);
-        CREATE INDEX IF NOT EXISTS idx_pair_horizon ON predictions(pair, horizon);
-        CREATE INDEX IF NOT EXISTS idx_resolved     ON predictions(resolved_at);
+        CREATE INDEX IF NOT EXISTS idx_matures_at ON predictions(matures_at);
+        CREATE INDEX IF NOT EXISTS idx_pair       ON predictions(pair);
+        CREATE INDEX IF NOT EXISTS idx_resolved   ON predictions(resolved_at);
+        CREATE INDEX IF NOT EXISTS idx_logged_at  ON predictions(logged_at);
 
         CREATE TABLE IF NOT EXISTS hourly_log (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             logged_at   TEXT NOT NULL,
             pairs_logged INTEGER NOT NULL,
+            pairs_skipped_cooldown INTEGER NOT NULL DEFAULT 0,
             errors      TEXT
         );
     """)
@@ -132,7 +111,19 @@ def setup_db():
     logger.info(f'Database ready at {DB_PATH}')
 
 
-# ── Inference ─────────────────────────────────────────────────────────────────
+# -- Cooldown tracking --
+
+def _get_cooldown_pairs(conn, now: datetime) -> set:
+    """Return pairs that have a trade logged within the last COOLDOWN_HOURS."""
+    cutoff = (now - timedelta(hours=COOLDOWN_HOURS)).isoformat()
+    rows = conn.execute("""
+        SELECT DISTINCT pair FROM predictions
+        WHERE is_tradeable = 1 AND logged_at > ?
+    """, (cutoff,)).fetchall()
+    return {row['pair'] for row in rows}
+
+
+# -- Inference --
 
 async def _init_buffer():
     """Initialize a CandleBuffer with fresh data from Polygon."""
@@ -152,50 +143,58 @@ def _run_inference_sync(buf) -> tuple[dict, dict]:
     """
     Run inference for all pairs using an existing CandleBuffer.
     Returns (predictions_by_pair, prices_by_pair)
-    Synchronous — call via asyncio.to_thread() to avoid blocking the event loop.
     """
     import sys
     sys.path.insert(0, str(BACKEND_DIR))
 
     from data_service import PAIRS
     from inference import Predictor
-    from features import build_feature_row
-
-    PAIR_IDS = {pair: i for i, pair in enumerate(PAIRS)}
+    from features import compute_features_for_pair
 
     predictor = Predictor()
 
-    closes_1h = buf.get_all_1h_closes()
     predictions = {}
     prices = {}
 
     for pair in PAIRS:
         try:
-            ohlcv_raw = buf.get_ohlcv(pair)
-            if not ohlcv_raw or '1H' not in ohlcv_raw:
-                logger.warning(f'No 1H data for {pair}')
+            ohlcv = buf.get_ohlcv(pair)
+
+            # Need 1m, 5m, 15m for microstructure features
+            if '1m' not in ohlcv or '5m' not in ohlcv or '15m' not in ohlcv:
+                logger.warning(f'Missing sub-hourly data for {pair}')
                 continue
 
-            # CandleBuffer.initialize() only keeps fully-closed bars for fetched
-            # timeframes (5m, 15m, 1H).  For 4H and 1D (resampled from 1H),
-            # the trailing bar may be partial — but the training pipeline also
-            # used the current-day 1D bar (with future data baked in), so using
-            # the partial bar is the closest live approximation.
-            ohlcv = dict(ohlcv_raw)
+            df_1m = ohlcv['1m']
+            df_5m = ohlcv['5m']
+            df_15m = ohlcv['15m']
 
-            features_df = build_feature_row(
-                ohlcv, closes_1h, pair, PAIR_IDS[pair],
-                expected_cols=predictor.feature_cols,
-            )
+            if len(df_1m) < 120:  # need at least ~2 hours of 1m data
+                logger.warning(f'Insufficient 1m data for {pair}: {len(df_1m)} bars')
+                continue
+
+            # Drop last candle from each TF -- may be incomplete (partially formed
+            # from live minute aggregates). Matches backtest and main.py behavior.
+            df_1m = df_1m.iloc[:-1] if len(df_1m) > 1 else df_1m
+            df_5m = df_5m.iloc[:-1] if len(df_5m) > 1 else df_5m
+            df_15m = df_15m.iloc[:-1] if len(df_15m) > 1 else df_15m
+
+            # Compute microstructure features
+            features_df = compute_features_for_pair(pair, df_1m, df_5m, df_15m)
 
             if features_df.empty:
+                logger.warning(f'Empty features for {pair}')
                 continue
 
             result = predictor.predict(features_df, pair)
             predictions[pair] = result
 
-            # Entry price = close of last complete 1H candle (after trim)
-            latest_close = float(ohlcv['1H']['close'].iloc[-1])
+            # Entry price = close of last complete 1H candle
+            if '1H' in ohlcv and not ohlcv['1H'].empty:
+                latest_close = float(ohlcv['1H']['close'].iloc[-1])
+            else:
+                # Fallback: use last 1m close
+                latest_close = float(df_1m['close'].iloc[-1])
             prices[pair] = latest_close
 
         except Exception as e:
@@ -205,20 +204,32 @@ def _run_inference_sync(buf) -> tuple[dict, dict]:
 
 
 async def _run_inference(buf) -> tuple[dict, dict]:
-    """Run inference in a thread so it doesn't block the event loop / dashboard."""
+    """Run inference in a thread so it doesn't block the event loop."""
     return await asyncio.to_thread(_run_inference_sync, buf)
 
 
-# ── Log predictions ───────────────────────────────────────────────────────────
+# -- Log predictions --
 
 async def log_predictions(buf):
     """Fetch predictions for all pairs and log them to the database."""
-    # Guard: skip during weekend market closure.
-    # Market closed: all day Saturday, Sunday before 21:00 UTC (Sydney open).
     now = datetime.now(timezone.utc)
+
+    # Skip during weekend market closure
+    # Also skip Friday evening when maturity would land in the weekend gap.
+    # FX closes ~Fri 22:00 UTC, reopens ~Sun 21:00 UTC.
+    # Backtest filter: no Saturday (dayofweek==5), no Sunday before 21:00.
     if now.weekday() == 5 or (now.weekday() == 6 and now.hour < 21):
-        logger.info(f'Market closed (weekend) — skipping inference.')
+        logger.info('Market closed (weekend) -- skipping inference.')
         return 0
+    # On Friday, skip if the exit candle would not fully close before market
+    # closes (~22:00 UTC). Maturity = last_candle + 5H, exit bar closes at
+    # matures_at, so we need matures_at <= Fri 22:00.  Simpler: skip if
+    # now + MATURITY_HOURS lands on Sat/Sun OR on Friday >= 22:00.
+    if now.weekday() == 4:
+        maturity_approx = now + timedelta(hours=MATURITY_HOURS)
+        if maturity_approx.weekday() in (5, 6) or (maturity_approx.weekday() == 4 and maturity_approx.hour >= 22):
+            logger.info('Friday late session -- exit candle would land after market close, skipping inference.')
+            return 0
 
     logger.info('Running inference...')
     predictions, prices = await _run_inference(buf)
@@ -226,123 +237,87 @@ async def log_predictions(buf):
     now = datetime.now(timezone.utc)
     conn = get_db()
     logged = 0
+    skipped_cooldown = 0
     errors = []
+
+    # Get pairs on cooldown
+    cooldown_pairs = _get_cooldown_pairs(conn, now)
 
     for pair, result in predictions.items():
         entry_price = prices.get(pair)
 
-        # Get the timestamp of the last complete 1H candle — this is "T" in the
-        # backtest sense.  CandleBuffer already dropped the incomplete bar, so
-        # index[-1] is the last fully-closed candle.
+        # Get the timestamp of the last complete 1H candle
         ohlcv = buf.get_ohlcv(pair)
         if ohlcv and '1H' in ohlcv and not ohlcv['1H'].empty:
             last_candle_time = ohlcv['1H'].index[-1].to_pydatetime()
             if last_candle_time.tzinfo is None:
                 last_candle_time = last_candle_time.replace(tzinfo=timezone.utc)
         else:
-            last_candle_time = now  # fallback
+            last_candle_time = now
 
-        for horizon in HORIZONS:
-            if horizon not in result['horizons']:
+        matures_at = last_candle_time + timedelta(hours=MATURITY_HOURS)
+
+        try:
+            # Skip if a prediction for this exact maturity already exists
+            existing = conn.execute("""
+                SELECT id FROM predictions
+                WHERE pair = ? AND matures_at = ?
+            """, (pair, matures_at.isoformat())).fetchone()
+            if existing:
                 continue
 
-            # Frequency guard: 4H logs every 4 hours, 1D logs every 24 hours.
-            # Cycle runs at XX:05 — check the current hour.
-            if horizon == '4H' and now.hour % 4 != 0:
-                continue
-            if horizon == '1D' and now.hour != 0:
-                continue
+            # Check cooldown for tradeable signals
+            if result['is_tradeable'] and pair in cooldown_pairs:
+                skipped_cooldown += 1
+                # Still log it but mark as not tradeable due to cooldown
+                result = dict(result)
+                result['is_tradeable'] = False
+                result['_cooldown_skipped'] = True
 
-            h = result['horizons'][horizon]
-            # last_candle_time = bar OPEN time e.g. T=03:00 (bar closes at 04:00).
-            # Entry price = close of that bar = price at 04:00.
-            # Label = log(close[T+1] / close[T]):
-            #   close[T]   = entry price @ 04:00
-            #   close[T+1] = exit price  @ 05:00 (bar T+1 opens 04:00, closes 05:00)
-            # _fetch_close_price finds bar with open < matures_at → returns close.
-            # matures_at = 03:00 + 2H = 05:00:
-            #   → finds bar opening at 04:00 (last bar with t < 05:00)
-            #   → returns its close = 05:00 price ✓
-            #   → resolve query fires only after 05:00 ✓
-            matures_at = last_candle_time + timedelta(hours=HORIZON_HOURS[horizon])
+            conn.execute("""
+                INSERT INTO predictions (
+                    logged_at, pair, direction,
+                    q25, q50, q75,
+                    meta_proba, is_tradeable,
+                    entry_price, matures_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                now.isoformat(),
+                pair,
+                result['direction'],
+                result['q25'],
+                result['q50'],
+                result['q75'],
+                result['meta_proba'],
+                int(result['is_tradeable']),
+                entry_price,
+                matures_at.isoformat(),
+            ))
+            logged += 1
 
-            try:
-                # Skip if a prediction for this exact candle already exists (resolved or not)
-                existing = conn.execute("""
-                    SELECT id FROM predictions
-                    WHERE pair = ? AND horizon = ? AND matures_at = ?
-                """, (pair, horizon, matures_at.isoformat())).fetchone()
-                if existing:
-                    continue
-
-
-                conn.execute("""
-                    INSERT INTO predictions (
-                        logged_at, pair, horizon, direction, probability,
-                        p_down, p_up, raw_p_down, signal_strength,
-                        expected_move, q10, q25, q50, q75, q90,
-                        cone_inner_low, cone_inner_high,
-                        cone_outer_low, cone_outer_high,
-                        low_conviction, quantile_spread,
-                        entry_price, matures_at
-                    ) VALUES (
-                        ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?,
-                        ?, ?,
-                        ?, ?,
-                        ?, ?,
-                        ?, ?
-                    )
-                """, (
-                    now.isoformat(),
-                    pair,
-                    horizon,
-                    h['direction'],
-                    h['probability'],
-                    h['calibrated_p_down'],
-                    h['calibrated_p_up'],
-                    h['raw_p_down'],
-                    h['signal_strength'],
-                    h['expected_move_pct'],
-                    h['quantiles']['Q10'],
-                    h['quantiles']['Q25'],
-                    h['quantiles']['Q50'],
-                    h['quantiles']['Q75'],
-                    h['quantiles']['Q90'],
-                    h['cone']['inner'][0],
-                    h['cone']['inner'][1],
-                    h['cone']['outer'][0],
-                    h['cone']['outer'][1],
-                    0,
-                    h['quantile_spread'],
-                    entry_price,
-                    matures_at.isoformat(),
-                ))
-                logged += 1
-
-            except Exception as e:
-                msg = f'{pair}/{horizon}: {e}'
-                errors.append(msg)
-                logger.error(msg)
+        except Exception as e:
+            msg = f'{pair}: {e}'
+            errors.append(msg)
+            logger.error(msg)
 
     conn.execute(
-        "INSERT INTO hourly_log (logged_at, pairs_logged, errors) VALUES (?, ?, ?)",
-        (now.isoformat(), logged, '; '.join(errors) if errors else None)
+        "INSERT INTO hourly_log (logged_at, pairs_logged, pairs_skipped_cooldown, errors) VALUES (?, ?, ?, ?)",
+        (now.isoformat(), logged, skipped_cooldown,
+         '; '.join(errors) if errors else None)
     )
     conn.commit()
     conn.close()
 
-    logger.info(f'Logged {logged} predictions for {len(predictions)} pairs. (candle T={last_candle_time.isoformat()})')
+    logger.info(f'Logged {logged} predictions for {len(predictions)} pairs. '
+                f'Cooldown skipped: {skipped_cooldown}. (candle T={last_candle_time.isoformat()})')
     return logged
 
 
-# ── Resolve outcomes ──────────────────────────────────────────────────────────
+# -- Resolve outcomes --
 
 async def _fetch_close_price(pair: str, at_time: datetime) -> float | None:
     """
-    Fetch the 1H candle close price at a specific time directly from Polygon REST.
-    No iloc[:-1] — this is just a price lookup for resolution, not feature computation.
+    Fetch the 1H candle close price at a specific time from Polygon REST.
     """
     import httpx
 
@@ -362,28 +337,33 @@ async def _fetch_close_price(pair: str, at_time: datetime) -> float | None:
             data = resp.json()
 
         results = data.get('results', [])
-        logger.info(f'Polygon {pair} at {at_time}: {len(results)} bars returned (status={data.get("status")})')
+        logger.info(f'Polygon {pair} at {at_time}: {len(results)} bars returned')
         if not results:
             return None
 
-        # Polygon bar['t'] = bar open time (ms).  A 1H bar starting at 22:00
-        # covers 22:00-23:00, its close = price at 23:00.
-        # We want the bar whose CLOSE corresponds to at_time, i.e. the bar
-        # that OPENED before at_time.  Use strict < so that at_time=05:00
-        # picks the bar opening at 04:00 (close = 05:00), not 05:00 (close = 06:00).
+        # Find the bar whose CLOSE corresponds to at_time.
+        # Bar opens at T, closes at T+1H. We want bar with open < at_time.
         target_ts = int(at_time.timestamp() * 1000)
         best = None
         for bar in results:
             if bar['t'] < target_ts:
                 best = bar
             else:
-                break  # results are sorted asc, no need to continue
+                break
 
         if best is not None:
+            # Validate: bar open should be exactly 1H before at_time
+            # (tolerance of 5 min for slight timestamp drifts)
+            expected_open_ms = target_ts - 3600 * 1000
+            if abs(best['t'] - expected_open_ms) > 300_000:
+                logger.warning(
+                    f'{pair}: nearest bar open {best["t"]} too far from expected '
+                    f'{expected_open_ms} (at_time={at_time}) -- likely weekend gap, skipping'
+                )
+                return None
             return float(best['c'])
 
-        # Fallback: at_time is before all bars (shouldn't happen with ±2h window)
-        return float(results[0]['c'])
+        return None
 
     except Exception as e:
         logger.warning(f'Failed to fetch close price for {pair} at {at_time}: {e}')
@@ -392,8 +372,8 @@ async def _fetch_close_price(pair: str, at_time: datetime) -> float | None:
 
 async def resolve_outcomes():
     """
-    Find predictions that have matured (matures_at <= now) and not yet resolved.
-    Fetches actual prices directly from Polygon REST (not from buffer).
+    Find predictions that have matured and not yet resolved.
+    Fetches actual prices from Polygon REST.
     """
     now = datetime.now(timezone.utc)
     conn = get_db()
@@ -414,32 +394,32 @@ async def resolve_outcomes():
     resolved = 0
 
     for row in pending:
-        pair    = row['pair']
-        horizon = row['horizon']
+        pair = row['pair']
 
         try:
             matures_at = datetime.fromisoformat(row['matures_at'])
 
             exit_price = await _fetch_close_price(pair, matures_at)
             if exit_price is None:
-                logger.warning(f'No candle yet for {pair}/{horizon} matured at {matures_at}')
+                logger.warning(f'No candle yet for {pair} matured at {matures_at}')
                 continue
 
-            entry_price  = row['entry_price']
+            entry_price = row['entry_price']
 
             if entry_price is None or entry_price == 0:
                 logger.warning(f'No entry price for prediction {row["id"]}')
                 continue
 
-            actual_return = np.log(exit_price / entry_price) * 100  # log return in %, matches training labels
+            # Log return (matches training labels)
+            actual_return = np.log(exit_price / entry_price)
 
             # Was the directional prediction correct?
-            # Predictions below 60% confidence are non-signals — still resolved
-            # (exit_price + actual_return recorded) but correct is left NULL.
+            # Only score tradeable predictions
             direction = row['direction']
-            probability = row['probability']
-            if probability < 0.60:
-                correct = None
+            is_tradeable = row['is_tradeable']
+
+            if not is_tradeable:
+                correct = None  # non-signal, still record return
             elif direction == 'bullish':
                 correct = int(actual_return > 0)
             elif direction == 'bearish':
@@ -449,15 +429,15 @@ async def resolve_outcomes():
 
             conn.execute("""
                 UPDATE predictions
-                SET resolved_at  = ?,
-                    exit_price   = ?,
+                SET resolved_at   = ?,
+                    exit_price    = ?,
                     actual_return = ?,
-                    correct      = ?
+                    correct       = ?
                 WHERE id = ?
             """, (
                 now.isoformat(),
                 exit_price,
-                round(actual_return, 6),
+                round(actual_return, 8),
                 correct,
                 row['id'],
             ))
@@ -472,10 +452,10 @@ async def resolve_outcomes():
     return resolved
 
 
-# ── Report ────────────────────────────────────────────────────────────────────
+# -- Report --
 
 def print_report():
-    """Print calibration + accuracy report on all resolved predictions."""
+    """Print accuracy report on all resolved predictions."""
     conn = get_db()
 
     total = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
@@ -483,127 +463,90 @@ def print_report():
     pending = total - resolved
 
     print('\n' + '=' * 65)
-    print('LUMENY PAPER TRADING REPORT')
+    print('LUMENY PAPER TRADING REPORT v5.1')
     print('=' * 65)
     print(f'Total predictions logged : {total:,}')
     print(f'Resolved                 : {resolved:,}')
     print(f'Pending                  : {pending:,}')
 
     if resolved == 0:
-        print('\nNo resolved predictions yet. Come back later.')
+        print('\nNo resolved predictions yet.')
         conn.close()
         return
 
     df = pd.read_sql("""
         SELECT * FROM predictions WHERE resolved_at IS NOT NULL AND correct IS NOT NULL
     """, conn)
-    df_all_resolved = pd.read_sql(
-        "SELECT * FROM predictions WHERE resolved_at IS NOT NULL", conn
-    )
+    df_all = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL", conn)
 
     if len(df) == 0:
-        print('\nNo scored predictions yet. Come back later.')
+        print('\nNo scored predictions yet.')
         conn.close()
         return
 
-    print(f'\nDate range: {df["logged_at"].min()[:10]} → {df["logged_at"].max()[:10]}')
+    print(f'\nDate range: {df["logged_at"].min()[:10]} -> {df["logged_at"].max()[:10]}')
 
-    # ── Accuracy by horizon + confidence bucket ───────────────────
+    # -- Overall accuracy --
     print('\n' + '-' * 65)
-    print('ACCURACY BY HORIZON & CONFIDENCE BUCKET')
+    print('OVERALL (tradeable signals only)')
     print('-' * 65)
+    overall_acc = df['correct'].mean()
+    print(f'  Accuracy: {overall_acc:.1%}  (n={len(df):,})')
 
-    buckets = [(0.50, 0.55), (0.55, 0.60), (0.60, 0.65),
-               (0.65, 0.70), (0.70, 0.80), (0.80, 1.00)]
+    # -- By meta_proba threshold --
+    print('\n' + '-' * 65)
+    print('ACCURACY BY META PROBABILITY THRESHOLD')
+    print('-' * 65)
+    thresholds = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    print(f'  {"Threshold":<12} {"Accuracy":<12} {"Count":<8} {"Avg |Return|"}')
+    print(f'  {"-"*48}')
 
-    for horizon in HORIZONS:
-        h_df = df[df['horizon'] == horizon]
-        if len(h_df) == 0:
+    for t in thresholds:
+        mask = df['meta_proba'] >= t
+        sub = df[mask]
+        if len(sub) < 5:
             continue
+        acc = sub['correct'].mean()
+        avg_ret = sub['actual_return'].abs().mean()
+        print(f'  P>={t:.2f}      {acc:.1%}        {len(sub):<8} {avg_ret:.6f}')
 
-        overall_acc = h_df['correct'].mean()
-        print(f'\nHorizon: {horizon}  (n={len(h_df):,}, overall acc={overall_acc:.1%})')
-        print(f'  {"Bucket":<12} {"Pred prob":<12} {"Actual acc":<13} {"Count":<8} {"Status"}')
-        print(f'  {"-"*52}')
-
-        for low, high in buckets:
-            mask = (h_df['probability'] >= low) & (h_df['probability'] < high)
-            sub  = h_df[mask]
-            if len(sub) < 10:
-                continue
-            pred_prob  = sub['probability'].mean()
-            actual_acc = sub['correct'].mean()
-            gap        = actual_acc - pred_prob
-            status     = 'OK' if abs(gap) < 0.05 else 'DRIFT'
-            print(f'  {low:.0%}–{high:.0%}      {pred_prob:.1%}        {actual_acc:.1%}         {len(sub):<8} {status}  (gap: {gap:+.3f})')
-
-    # ── MCE by horizon ────────────────────────────────────────────
+    # -- By pair --
     print('\n' + '-' * 65)
-    print('CALIBRATION (MCE) BY HORIZON')
+    print('ACCURACY BY PAIR')
     print('-' * 65)
-    print(f'  {"Horizon":<10} {"MCE":<10} {"n"}')
-    print(f'  {"-"*30}')
+    print(f'  {"Pair":<10} {"Accuracy":<12} {"Count":<8} {"Win Rate"}')
+    print(f'  {"-"*40}')
 
-    for horizon in HORIZONS:
-        h_df_r = df_all_resolved[df_all_resolved['horizon'] == horizon]
-        if len(h_df_r) < 20:
-            print(f'  {horizon:<10} {"insufficient data":<10}')
+    for pair in sorted(df['pair'].unique()):
+        p_df = df[df['pair'] == pair]
+        if len(p_df) < 3:
             continue
+        acc = p_df['correct'].mean()
+        print(f'  {pair:<10} {acc:.1%}        {len(p_df):<8}')
 
-        # Match notebook MCE: bin on p_down (0–1 scale), y_binary = actual_return < 0
-        h_df_r = h_df_r[h_df_r['actual_return'].notna()]
-        bins = np.linspace(0, 1, 16)
-        bp, ba = [], []
-        for i in range(len(bins) - 1):
-            mask = (h_df_r['p_down'] >= bins[i]) & (h_df_r['p_down'] < bins[i+1])
-            if mask.sum() > 5:
-                bp.append(h_df_r.loc[mask, 'p_down'].mean())
-                ba.append((h_df_r.loc[mask, 'actual_return'] < 0).mean())
-        if bp:
-            mce = np.mean(np.abs(np.array(bp) - np.array(ba)))
-            print(f'  {horizon:<10} {mce:<10.3f} {len(h_df_r):,}')
-
-    # ── Economic significance ─────────────────────────────────────
+    # -- Economic significance --
     print('\n' + '-' * 65)
-    print('ECONOMIC SIGNIFICANCE (high conviction only, >=65%)')
+    print('ECONOMIC SIGNIFICANCE')
     print('-' * 65)
-    print(f'  {"Horizon":<10} {"Avg |move|":<14} {"Win rate":<12} {"EV (est)"}')
-    print(f'  {"-"*50}')
 
-    AVG_SPREAD = 0.00028  # ~2.8 pips average
+    avg_move = df['actual_return'].abs().mean()
+    win_rate = df['correct'].mean()
+    ev = (win_rate * avg_move) - ((1 - win_rate) * avg_move) - AVG_SPREAD
+    print(f'  Avg |move|: {avg_move:.6f}')
+    print(f'  Win rate:   {win_rate:.1%}')
+    print(f'  EV/trade:   {ev:.6f}  (after {AVG_SPREAD:.5f} spread)')
 
-    for horizon in HORIZONS:
-        h_df = df[(df['horizon'] == horizon) & (df['probability'] >= 0.65)]
-        if len(h_df) < 10:
-            continue
-        avg_move = h_df['actual_return'].abs().mean()
-        win_rate = h_df['correct'].mean()
-        ev = (win_rate * avg_move) - ((1 - win_rate) * avg_move) - (AVG_SPREAD * 100)
-        print(f'  {horizon:<10} {avg_move:.4f}%       {win_rate:.1%}        EV: {ev:+.4f}%')
-
-    # ── Conviction flag check ─────────────────────────────────────
-    print('\n' + '-' * 65)
-    print('LOW CONVICTION FLAG ACCURACY')
-    print('-' * 65)
-    normal = df[df['low_conviction'] == 0]
-    low    = df[df['low_conviction'] == 1]
-    if len(normal) > 0:
-        print(f'  Normal conviction (n={len(normal):,}): acc={normal["correct"].mean():.1%}')
-    if len(low) > 0:
-        print(f'  Low conviction    (n={len(low):,}):  acc={low["correct"].mean():.1%}')
-        print(f'  → Low conviction should have lower accuracy than normal.')
-
-    # ── Weekly summary ────────────────────────────────────────────
+    # -- Weekly summary --
     print('\n' + '-' * 65)
     print('WEEKLY SUMMARY')
     print('-' * 65)
-    df['week'] = pd.to_datetime(df['logged_at']).dt.isocalendar().week
-    df['year'] = pd.to_datetime(df['logged_at']).dt.isocalendar().year
+    df['logged_dt'] = pd.to_datetime(df['logged_at'])
+    df['week'] = df['logged_dt'].dt.isocalendar().week.astype(int)
+    df['year'] = df['logged_dt'].dt.isocalendar().year.astype(int)
 
     weekly = df.groupby(['year', 'week']).agg(
         n=('correct', 'count'),
         acc=('correct', 'mean'),
-        mce_proxy=('probability', lambda x: abs(x.mean() - df.loc[x.index, 'correct'].mean()))
     ).reset_index()
 
     print(f'  {"Year":<6} {"Week":<6} {"n":<8} {"Accuracy"}')
@@ -615,40 +558,39 @@ def print_report():
     conn.close()
 
 
-# ── Continuous loop ───────────────────────────────────────────────────────────
+# -- Continuous loop --
 
 async def run_loop():
     """Run log + resolve every hour indefinitely."""
     logger.info('Starting paper trading loop (every 60 minutes)...')
     while True:
         try:
-            # Fetch data once, reuse for both logging and resolving
             buf = await _init_buffer()
             await resolve_outcomes()
             await log_predictions(buf)
         except Exception as e:
             logger.error(f'Loop error: {e}', exc_info=True)
 
-        # Sleep until XX:05 of the next hour to ensure cycle always starts
-        # within the first few minutes of a new candle period.
+        # Sleep until XX:02 of the next hour — run as early as possible
+        # after the 1H candle closes to minimize position entry delay.
         now = datetime.now(timezone.utc)
-        next_run = (now + timedelta(hours=1)).replace(minute=5, second=0, microsecond=0)
+        next_run = (now + timedelta(hours=1)).replace(minute=2, second=0, microsecond=0)
         sleep_secs = (next_run - now).total_seconds()
         logger.info(f'Sleeping until {next_run.strftime("%H:%M")} UTC ({sleep_secs/60:.1f} min)...')
         await asyncio.sleep(sleep_secs)
 
 
-# ── Monitoring API ────────────────────────────────────────────────────────────
+# -- Monitoring API --
 
 from fastapi import FastAPI, Query as Q, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import jwt
 
-monitor_app = FastAPI(title='LumenY Paper Trading Monitor', version='1.0.0')
+monitor_app = FastAPI(title='LumenY Paper Trading Monitor v5.1', version='2.0.0')
 monitor_app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# -- Auth --
 
 _JWT_SECRET   = os.environ.get('JWT_SECRET', 'change-me-in-production')
 _MONITOR_PASS = os.environ.get('MONITOR_PASSWORD', '')
@@ -689,135 +631,19 @@ async def login(body: dict):
     return response
 
 
-def _get_report_data() -> dict:
-    """Generate the full report as a JSON-serializable dict."""
-    conn = get_db()
-    total = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
-    resolved_count = conn.execute("SELECT COUNT(*) FROM predictions WHERE resolved_at IS NOT NULL").fetchone()[0]
-    pending_count = total - resolved_count
-
-    report = {
-        'total_predictions': total,
-        'resolved': resolved_count,
-        'pending': pending_count,
-        'horizons': {},
-        'calibration': {},
-        'economic': {},
-        'conviction': {},
-        'weekly': [],
-    }
-
-    if resolved_count == 0:
-        conn.close()
-        return report
-
-    df = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL AND correct IS NOT NULL", conn)
-    df_all_resolved = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL", conn)
-    if len(df) == 0:
-        conn.close()
-        return report
-    report['date_range'] = {
-        'from': df['logged_at'].min()[:10],
-        'to': df['logged_at'].max()[:10],
-    }
-
-    buckets = [(0.50, 0.55), (0.55, 0.60), (0.60, 0.65),
-               (0.65, 0.70), (0.70, 0.80), (0.80, 1.00)]
-
-    for horizon in HORIZONS:
-        h_df = df[df['horizon'] == horizon]
-        if len(h_df) == 0:
-            continue
-
-        h_report = {
-            'n': int(len(h_df)),
-            'overall_accuracy': round(float(h_df['correct'].mean()), 4),
-            'buckets': [],
-        }
-
-        for low, high in buckets:
-            mask = (h_df['probability'] >= low) & (h_df['probability'] < high)
-            sub = h_df[mask]
-            if len(sub) < 3:
-                continue
-            pred_prob = float(sub['probability'].mean())
-            actual_acc = float(sub['correct'].mean())
-            gap = actual_acc - pred_prob
-            h_report['buckets'].append({
-                'range': f'{low:.0%}-{high:.0%}',
-                'predicted_prob': round(pred_prob, 4),
-                'actual_accuracy': round(actual_acc, 4),
-                'count': int(len(sub)),
-                'gap': round(gap, 4),
-                'status': 'OK' if abs(gap) < 0.05 else 'DRIFT',
-            })
-
-        report['horizons'][horizon] = h_report
-
-    # MCE — match notebook: bin on p_down (0–1), y_binary = actual_return < 0, all resolved rows
-    for horizon in HORIZONS:
-        h_df_r = df_all_resolved[df_all_resolved['horizon'] == horizon]
-        if len(h_df_r) < 20:
-            report['calibration'][horizon] = {'mce': None, 'n': int(len(h_df_r)), 'status': 'insufficient_data'}
-            continue
-        h_df_r = h_df_r[h_df_r['actual_return'].notna()]
-        bins = np.linspace(0, 1, 16)
-        bp, ba = [], []
-        for i in range(len(bins) - 1):
-            mask = (h_df_r['p_down'] >= bins[i]) & (h_df_r['p_down'] < bins[i+1])
-            if mask.sum() > 5:
-                bp.append(float(h_df_r.loc[mask, 'p_down'].mean()))
-                ba.append(float((h_df_r.loc[mask, 'actual_return'] < 0).mean()))
-        if bp:
-            mce = float(np.mean(np.abs(np.array(bp) - np.array(ba))))
-            report['calibration'][horizon] = {'mce': round(mce, 4), 'n': int(len(h_df_r))}
-
-    # Economic significance
-    AVG_SPREAD = 0.00028
-    for horizon in HORIZONS:
-        h_df = df[(df['horizon'] == horizon) & (df['probability'] >= 0.65)]
-        if len(h_df) < 5:
-            continue
-        avg_move = float(h_df['actual_return'].abs().mean())
-        win_rate = float(h_df['correct'].mean())
-        ev = (win_rate * avg_move) - ((1 - win_rate) * avg_move) - (AVG_SPREAD * 100)
-        report['economic'][horizon] = {
-            'avg_move_pct': round(avg_move, 4),
-            'win_rate': round(win_rate, 4),
-            'ev_pct': round(ev, 4),
-            'n': int(len(h_df)),
-        }
-
-    # Accuracy by probability threshold (p>=70% matches backtest key metric)
-    for horizon in HORIZONS:
-        h_df = df[df['horizon'] == horizon]
-        h_df_70 = h_df[h_df['probability'] >= 0.70]
-        if len(h_df_70) > 0:
-            report['conviction'][horizon] = {'n': int(len(h_df_70)), 'accuracy': round(float(h_df_70['correct'].mean()), 4)}
-
-    # Weekly
-    df['logged_dt'] = pd.to_datetime(df['logged_at'])
-    df['week'] = df['logged_dt'].dt.isocalendar().week.astype(int)
-    df['year'] = df['logged_dt'].dt.isocalendar().year.astype(int)
-    weekly = df.groupby(['year', 'week']).agg(n=('correct', 'count'), acc=('correct', 'mean')).reset_index()
-    for _, row in weekly.iterrows():
-        report['weekly'].append({'year': int(row['year']), 'week': int(row['week']), 'n': int(row['n']), 'accuracy': round(float(row['acc']), 4)})
-
-    conn.close()
-    return report
-
+# -- API endpoints --
 
 @monitor_app.get('/api/monitor/report')
 async def api_report(_: None = Depends(_require_auth)):
-    """Full calibration & accuracy report."""
+    """Full accuracy report."""
     return _get_report_data()
 
 
 @monitor_app.get('/api/monitor/predictions')
 async def api_predictions(
     pair: str = Q(default=None),
-    horizon: str = Q(default=None),
     resolved: bool = Q(default=None),
+    tradeable: bool = Q(default=None),
     limit: int = Q(default=100),
     _: None = Depends(_require_auth),
 ):
@@ -828,14 +654,14 @@ async def api_predictions(
     if pair:
         query += " AND pair = ?"
         params.append(pair.upper())
-    if horizon:
-        query += " AND horizon = ?"
-        params.append(horizon)
     if resolved is not None:
         if resolved:
             query += " AND resolved_at IS NOT NULL"
         else:
             query += " AND resolved_at IS NULL"
+    if tradeable is not None:
+        query += " AND is_tradeable = ?"
+        params.append(int(tradeable))
     query += " ORDER BY logged_at DESC LIMIT ?"
     params.append(limit)
 
@@ -846,26 +672,25 @@ async def api_predictions(
 
 @monitor_app.get('/api/monitor/summary')
 async def api_summary(_: None = Depends(_require_auth)):
-    """Quick summary: total, resolved, pending, accuracy per horizon."""
+    """Quick summary."""
     conn = get_db()
     total = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
     resolved = conn.execute("SELECT COUNT(*) FROM predictions WHERE resolved_at IS NOT NULL").fetchone()[0]
+    tradeable_total = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_tradeable = 1").fetchone()[0]
 
     summary = {
         'total': total,
         'resolved': resolved,
         'pending': total - resolved,
-        'horizons': {},
+        'tradeable_total': tradeable_total,
     }
 
     if resolved > 0:
-        for horizon in HORIZONS:
-            row = conn.execute(
-                "SELECT COUNT(*) as n, AVG(correct) as acc FROM predictions WHERE horizon = ? AND resolved_at IS NOT NULL AND correct IS NOT NULL",
-                (horizon,)
-            ).fetchone()
-            if row['n'] > 0:
-                summary['horizons'][horizon] = {'n': row['n'], 'accuracy': round(float(row['acc']), 4)}
+        row = conn.execute(
+            "SELECT COUNT(*) as n, AVG(correct) as acc FROM predictions WHERE resolved_at IS NOT NULL AND correct IS NOT NULL"
+        ).fetchone()
+        if row['n'] > 0:
+            summary['accuracy'] = {'n': row['n'], 'accuracy': round(float(row['acc']), 4)}
 
     conn.close()
     return summary
@@ -873,15 +698,14 @@ async def api_summary(_: None = Depends(_require_auth)):
 
 @monitor_app.get('/api/monitor/debug')
 async def api_debug():
-    """Last 20 resolved 1H predictions — no auth required for debugging."""
+    """Last 20 resolved predictions -- no auth required."""
     conn = get_db()
     rows = conn.execute("""
-        SELECT id, pair, horizon, direction, probability, q50,
-               q10, q25, q75, q90, p_down, p_up,
+        SELECT id, pair, direction, q25, q50, q75, meta_proba, is_tradeable,
                entry_price, exit_price, actual_return, correct,
                logged_at, matures_at, resolved_at
         FROM predictions
-        WHERE horizon = '1H' AND resolved_at IS NOT NULL
+        WHERE resolved_at IS NOT NULL
         ORDER BY id DESC LIMIT 20
     """).fetchall()
     conn.close()
@@ -890,11 +714,7 @@ async def api_debug():
 
 @monitor_app.get('/api/monitor/live-snapshot')
 async def api_live_snapshot():
-    """
-    Fetch last 3 days of 1H OHLCV from Polygon for each pair and return
-    candle times + prices — lightweight check, no full inference.
-    No auth required, for debugging.
-    """
+    """Fetch last 3 days of 1H OHLCV for each pair -- no auth required."""
     import httpx
     from data_service import PAIRS
 
@@ -919,31 +739,18 @@ async def api_live_snapshot():
                     snapshot['pairs'][pair] = {'error': 'no data', 'status': data.get('status')}
                     continue
 
-                # Last 3 bars (before the current open bar — bar['t'] < current_hour_start)
                 current_hour_ms = int(now.replace(minute=0, second=0, microsecond=0).timestamp() * 1000)
                 closed_bars = [b for b in results if b['t'] < current_hour_ms]
                 last_closed = closed_bars[-1] if closed_bars else None
-                last_open = results[-1]  # most recent bar (may be open)
 
                 snapshot['pairs'][pair] = {
                     'total_bars_returned': len(results),
                     'closed_bars_count': len(closed_bars),
                     'last_closed_bar': {
                         'open_time_utc': datetime.fromtimestamp(last_closed['t'] / 1000, tz=timezone.utc).isoformat() if last_closed else None,
-                        'open': last_closed['o'] if last_closed else None,
                         'close': last_closed['c'] if last_closed else None,
-                        'high': last_closed['h'] if last_closed else None,
-                        'low': last_closed['l'] if last_closed else None,
                     },
-                    'most_recent_bar': {
-                        'open_time_utc': datetime.fromtimestamp(last_open['t'] / 1000, tz=timezone.utc).isoformat(),
-                        'open': last_open['o'],
-                        'close': last_open['c'],
-                        'is_open_bar': last_open['t'] >= current_hour_ms,
-                    },
-                    'expected_last_candle_time': datetime.fromtimestamp(last_closed['t'] / 1000, tz=timezone.utc).isoformat() if last_closed else None,
                     'expected_entry_price': last_closed['c'] if last_closed else None,
-                    'expected_matures_at_1H': datetime.fromtimestamp((last_closed['t'] + 3600_000) / 1000, tz=timezone.utc).isoformat() if last_closed else None,
                 }
             except Exception as e:
                 snapshot['pairs'][pair] = {'error': str(e)}
@@ -953,7 +760,6 @@ async def api_live_snapshot():
 
 @monitor_app.get('/api/monitor/health')
 async def api_health(_: None = Depends(_require_auth)):
-    """Check if the paper trading system is running."""
     conn = get_db()
     last_log = conn.execute("SELECT * FROM hourly_log ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
@@ -964,24 +770,117 @@ async def api_health(_: None = Depends(_require_auth)):
     }
 
 
+def _get_report_data() -> dict:
+    """Generate the full report as a JSON-serializable dict."""
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    resolved_count = conn.execute("SELECT COUNT(*) FROM predictions WHERE resolved_at IS NOT NULL").fetchone()[0]
+    tradeable_count = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_tradeable = 1").fetchone()[0]
+    pending_count = total - resolved_count
+
+    report = {
+        'total_predictions': total,
+        'resolved': resolved_count,
+        'pending': pending_count,
+        'tradeable_total': tradeable_count,
+        'accuracy': {},
+        'by_threshold': [],
+        'by_pair': {},
+        'economic': {},
+        'weekly': [],
+    }
+
+    if resolved_count == 0:
+        conn.close()
+        return report
+
+    df = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL AND correct IS NOT NULL", conn)
+    df_all = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL", conn)
+
+    if len(df) == 0:
+        conn.close()
+        return report
+
+    report['date_range'] = {
+        'from': df['logged_at'].min()[:10],
+        'to': df['logged_at'].max()[:10],
+    }
+
+    # Overall accuracy (tradeable only)
+    report['accuracy'] = {
+        'n': int(len(df)),
+        'value': round(float(df['correct'].mean()), 4),
+    }
+
+    # By meta threshold (strict > to match backtest)
+    for t in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
+        mask = df['meta_proba'] > t
+        sub = df[mask]
+        if len(sub) < 3:
+            continue
+        report['by_threshold'].append({
+            'threshold': t,
+            'accuracy': round(float(sub['correct'].mean()), 4),
+            'count': int(len(sub)),
+            'avg_return': round(float(sub['actual_return'].abs().mean()), 8),
+        })
+
+    # By pair
+    for pair in sorted(df['pair'].unique()):
+        p_df = df[df['pair'] == pair]
+        if len(p_df) < 3:
+            continue
+        report['by_pair'][pair] = {
+            'n': int(len(p_df)),
+            'accuracy': round(float(p_df['correct'].mean()), 4),
+        }
+
+    # Economic
+    avg_move = float(df['actual_return'].abs().mean())
+    win_rate = float(df['correct'].mean())
+    ev = (win_rate * avg_move) - ((1 - win_rate) * avg_move) - AVG_SPREAD
+    report['economic'] = {
+        'avg_move': round(avg_move, 8),
+        'win_rate': round(win_rate, 4),
+        'ev_per_trade': round(ev, 8),
+        'n': int(len(df)),
+    }
+
+    # Weekly
+    df['logged_dt'] = pd.to_datetime(df['logged_at'])
+    df['week'] = df['logged_dt'].dt.isocalendar().week.astype(int)
+    df['year'] = df['logged_dt'].dt.isocalendar().year.astype(int)
+    weekly = df.groupby(['year', 'week']).agg(n=('correct', 'count'), acc=('correct', 'mean')).reset_index()
+    for _, row in weekly.iterrows():
+        report['weekly'].append({
+            'year': int(row['year']),
+            'week': int(row['week']),
+            'n': int(row['n']),
+            'accuracy': round(float(row['acc']), 4),
+        })
+
+    conn.close()
+    return report
+
+
 @monitor_app.get('/api/monitor/dashboard-data')
 async def api_dashboard_data(_: None = Depends(_require_auth)):
     """All data needed for the monitoring dashboard in one call."""
     conn = get_db()
     total = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
     resolved_count = conn.execute("SELECT COUNT(*) FROM predictions WHERE resolved_at IS NOT NULL").fetchone()[0]
+    tradeable_count = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_tradeable = 1").fetchone()[0]
 
     data = {
         'total': total,
         'resolved': resolved_count,
         'pending': total - resolved_count,
-        'horizons': {},
+        'tradeable_total': tradeable_count,
+        'accuracy': None,
+        'by_threshold': [],
         'pairs': {},
-        'calibration_curve': {},
-        'confidence_distribution': {},
         'daily_accuracy': [],
         'weekly': [],
-        'conviction': {},
         'economic': {},
         'last_log': None,
     }
@@ -995,117 +894,106 @@ async def api_dashboard_data(_: None = Depends(_require_auth)):
         return data
 
     df = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL AND correct IS NOT NULL", conn)
-    df_all_resolved = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL", conn)
-    all_df = pd.read_sql("SELECT logged_at, pair, horizon, probability, direction, low_conviction FROM predictions", conn)
+    df_all = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL", conn)
     conn.close()
+
+    if len(df) == 0:
+        return data
 
     data['date_range'] = {
         'from': df['logged_at'].min()[:10],
         'to': df['logged_at'].max()[:10],
     }
 
-    # ── Per-horizon stats ──
-    for horizon in HORIZONS:
-        h_df = df[df['horizon'] == horizon]
-        if len(h_df) == 0:
+    # Overall accuracy
+    data['accuracy'] = {
+        'n': int(len(df)),
+        'value': round(float(df['correct'].mean()), 4),
+    }
+
+    # Compute PnL per trade: pred_dir * actual_return - spread
+    # pred_dir = +1 for bullish, -1 for bearish
+    df['pred_dir'] = df['direction'].map({'bullish': 1, 'bearish': -1}).fillna(0)
+    df['pnl'] = df['pred_dir'] * df['actual_return'] - AVG_SPREAD
+
+    # By meta threshold (strict > to match backtest)
+    for t in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
+        mask = df['meta_proba'] > t
+        sub = df[mask]
+        if len(sub) < 3:
             continue
-        data['horizons'][horizon] = {
-            'n': int(len(h_df)),
-            'accuracy': round(float(h_df['correct'].mean()), 4),
-            'avg_probability': round(float(h_df['probability'].mean()), 4),
-            'avg_actual_return': round(float(h_df['actual_return'].mean()), 4),
+        sub_pnl = sub['pnl']
+        data['by_threshold'].append({
+            'threshold': t,
+            'accuracy': round(float(sub['correct'].mean()), 4),
+            'count': int(len(sub)),
+            'ev_bps': round(float(sub_pnl.mean() * 10000), 2),
+            'total_pnl': round(float(sub_pnl.sum()), 6),
+            'avg_move_bps': round(float(sub['actual_return'].abs().mean() * 10000), 2),
+        })
+
+    # Per-pair stats
+    for pair in sorted(df['pair'].unique()):
+        p_df = df[df['pair'] == pair]
+        if len(p_df) < 1:
+            continue
+        p_pnl = p_df['pnl']
+        data['pairs'][pair] = {
+            'n': int(len(p_df)),
+            'accuracy': round(float(p_df['correct'].mean()), 4),
+            'ev_bps': round(float(p_pnl.mean() * 10000), 2),
+            'total_pnl': round(float(p_pnl.sum()), 6),
         }
 
-    # ── Per-pair stats ──
-    for pair in df['pair'].unique():
-        p_df = df[df['pair'] == pair]
-        pair_data = {'n': int(len(p_df)), 'accuracy': round(float(p_df['correct'].mean()), 4), 'horizons': {}}
-        for horizon in HORIZONS:
-            ph_df = p_df[p_df['horizon'] == horizon]
-            if len(ph_df) >= 3:
-                pair_data['horizons'][horizon] = {
-                    'n': int(len(ph_df)),
-                    'accuracy': round(float(ph_df['correct'].mean()), 4),
-                }
-        data['pairs'][pair] = pair_data
-
-    # ── Calibration curve (reliability diagram data) ──
-    # Matches notebook: bin on p_down (0–1), y_binary = actual_return < 0
-    for horizon in HORIZONS:
-        h_df_r = df_all_resolved[df_all_resolved['horizon'] == horizon]
-        if len(h_df_r) < 10:
-            continue
-        bins = np.linspace(0, 1, 16)
-        points = []
-        for i in range(len(bins) - 1):
-            mask = (h_df_r['p_down'] >= bins[i]) & (h_df_r['p_down'] < bins[i + 1])
-            if mask.sum() >= 3:
-                points.append({
-                    'bin_center': round(float((bins[i] + bins[i + 1]) / 2), 3),
-                    'predicted': round(float(h_df_r.loc[mask, 'p_down'].mean()), 4),
-                    'actual': round(float((h_df_r.loc[mask, 'actual_return'] < 0).mean()), 4),
-                    'count': int(mask.sum()),
-                })
-        if points:
-            mce = round(float(np.mean([abs(p['predicted'] - p['actual']) for p in points])), 4)
-            data['calibration_curve'][horizon] = {'points': points, 'mce': mce}
-
-    # ── Confidence distribution (all predictions, not just resolved) ──
-    for horizon in HORIZONS:
-        h_all = all_df[all_df['horizon'] == horizon]
-        if len(h_all) == 0:
-            continue
-        bins = np.linspace(0.5, 1.0, 11)
-        hist = []
-        for i in range(len(bins) - 1):
-            mask = (h_all['probability'] >= bins[i]) & (h_all['probability'] < bins[i + 1])
-            hist.append({
-                'range': f'{bins[i]:.0%}-{bins[i+1]:.0%}',
-                'count': int(mask.sum()),
-            })
-        data['confidence_distribution'][horizon] = hist
-
-    # ── Daily accuracy trend ──
+    # Daily accuracy + PnL trend
     df['logged_dt'] = pd.to_datetime(df['logged_at'])
     df['date'] = df['logged_dt'].dt.date.astype(str)
-    daily = df.groupby('date').agg(n=('correct', 'count'), acc=('correct', 'mean'), avg_prob=('probability', 'mean')).reset_index()
+    daily = df.groupby('date').agg(
+        n=('correct', 'count'),
+        acc=('correct', 'mean'),
+        daily_pnl=('pnl', 'sum'),
+    ).reset_index()
+    cum_pnl = 0.0
     for _, row in daily.iterrows():
+        cum_pnl += row['daily_pnl']
         data['daily_accuracy'].append({
             'date': row['date'],
             'n': int(row['n']),
             'accuracy': round(float(row['acc']), 4),
-            'avg_probability': round(float(row['avg_prob']), 4),
+            'daily_pnl_bps': round(float(row['daily_pnl'] * 10000), 2),
+            'cum_pnl_bps': round(float(cum_pnl * 10000), 2),
         })
 
-    # ── Weekly ──
+    # Weekly
     df['week'] = df['logged_dt'].dt.isocalendar().week.astype(int)
     df['year'] = df['logged_dt'].dt.isocalendar().year.astype(int)
-    weekly = df.groupby(['year', 'week']).agg(n=('correct', 'count'), acc=('correct', 'mean')).reset_index()
+    weekly = df.groupby(['year', 'week']).agg(
+        n=('correct', 'count'),
+        acc=('correct', 'mean'),
+        weekly_pnl=('pnl', 'sum'),
+    ).reset_index()
     for _, row in weekly.iterrows():
-        data['weekly'].append({'year': int(row['year']), 'week': int(row['week']), 'n': int(row['n']), 'accuracy': round(float(row['acc']), 4)})
+        data['weekly'].append({
+            'year': int(row['year']),
+            'week': int(row['week']),
+            'n': int(row['n']),
+            'accuracy': round(float(row['acc']), 4),
+            'pnl_bps': round(float(row['weekly_pnl'] * 10000), 2),
+        })
 
-    # ── Accuracy at p>=70% threshold (matches backtest key metric) ──
-    for horizon in HORIZONS:
-        h_df = df[df['horizon'] == horizon]
-        h_df_70 = h_df[h_df['probability'] >= 0.70]
-        if len(h_df_70) > 0:
-            data['conviction'][horizon] = {'n': int(len(h_df_70)), 'accuracy': round(float(h_df_70['correct'].mean()), 4)}
-
-    # ── Economic significance ──
-    AVG_SPREAD = 0.00028
-    for horizon in HORIZONS:
-        h_df = df[(df['horizon'] == horizon) & (df['probability'] >= 0.65)]
-        if len(h_df) < 5:
-            continue
-        avg_move = float(h_df['actual_return'].abs().mean())
-        win_rate = float(h_df['correct'].mean())
-        ev = (win_rate * avg_move) - ((1 - win_rate) * avg_move) - (AVG_SPREAD * 100)
-        data['economic'][horizon] = {
-            'avg_move_pct': round(avg_move, 4),
-            'win_rate': round(win_rate, 4),
-            'ev_pct': round(ev, 4),
-            'n': int(len(h_df)),
-        }
+    # Economic
+    avg_move = float(df['actual_return'].abs().mean())
+    win_rate = float(df['correct'].mean())
+    total_pnl = float(df['pnl'].sum())
+    ev = float(df['pnl'].mean())
+    data['economic'] = {
+        'avg_move_bps': round(avg_move * 10000, 2),
+        'win_rate': round(win_rate, 4),
+        'ev_per_trade_bps': round(ev * 10000, 2),
+        'total_pnl': round(total_pnl, 6),
+        'total_pnl_bps': round(total_pnl * 10000, 2),
+        'n': int(len(df)),
+    }
 
     return data
 
@@ -1124,7 +1012,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LumenY Paper Trading Monitor</title>
+<title>LumenY Paper Trading v5.1</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1169,8 +1057,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="header">
   <div style="display:flex; justify-content:space-between; align-items:center;">
     <div>
-      <h1>LumenY Paper Trading Monitor</h1>
-      <div class="subtitle">Live model validation &mdash; does the model match backtest?</div>
+      <h1>LumenY Paper Trading v5.1</h1>
+      <div class="subtitle">Microstructure model &mdash; 4H forward, meta-filtered, per-pair cooldown</div>
     </div>
     <button class="refresh-btn" onclick="loadData()">Refresh</button>
   </div>
@@ -1184,15 +1072,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-const HORIZONS = ['1H', '4H', '1D'];
-const COLORS = { '1H': '#58a6ff', '4H': '#bc8cff', '1D': '#f0883e' };
-let charts = {};
-
 function showLogin(error) {
   document.body.innerHTML = `
     <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0a0e17;">
       <div style="background:#0d1420;border:1px solid #1e2d45;border-radius:12px;padding:40px;width:340px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:#58a6ff;margin-bottom:8px;">LumenY</div>
+        <div style="font-size:22px;font-weight:700;color:#58a6ff;margin-bottom:8px;">LumenY v5.1</div>
         <div style="color:#7d8fa3;margin-bottom:28px;font-size:13px;">Paper Trading Monitor</div>
         ${error ? '<div style="color:#f85149;margin-bottom:16px;font-size:13px;">' + error + '</div>' : ''}
         <input id="pw" type="password" placeholder="Password" autofocus
@@ -1223,7 +1107,6 @@ async function doLogin() {
 
 function fmt(v, d=1) { return v != null ? (v * 100).toFixed(d) + '%' : 'N/A'; }
 function accClass(v) { return v >= 0.55 ? 'good' : v >= 0.50 ? 'warn' : 'bad'; }
-function mceClass(v) { return v <= 0.03 ? 'good' : v <= 0.06 ? 'warn' : 'bad'; }
 
 async function loadData() {
   try {
@@ -1232,131 +1115,112 @@ async function loadData() {
     const d = await res.json();
     render(d);
   } catch(e) {
-    document.getElementById('grid').innerHTML = '<div class="loading">Error loading data: ' + e.message + '</div>';
+    document.getElementById('grid').innerHTML = '<div class="loading">Error: ' + e.message + '</div>';
   }
 }
 
 function render(d) {
-  // Status bar
   const sb = document.getElementById('statusBar');
   const lastLog = d.last_log ? d.last_log.logged_at : 'never';
+  const cooldownSkipped = d.last_log ? (d.last_log.pairs_skipped_cooldown || 0) : 0;
   sb.innerHTML = `
     <div class="status-item"><span class="label">Last run:</span> <span class="value">${lastLog}</span></div>
     <div class="status-item"><span class="label">Total:</span> <span class="value">${d.total}</span></div>
     <div class="status-item"><span class="label">Resolved:</span> <span class="value good">${d.resolved}</span></div>
     <div class="status-item"><span class="label">Pending:</span> <span class="value warn">${d.pending}</span></div>
+    <div class="status-item"><span class="label">Tradeable:</span> <span class="value">${d.tradeable_total}</span></div>
     <div class="status-item"><span class="label">Date range:</span> <span class="value">${d.date_range ? d.date_range.from + ' to ' + d.date_range.to : 'N/A'}</span></div>
   `;
 
-  // KPIs
   const kpi = document.getElementById('kpiRow');
-  let overallAcc = d.resolved > 0 ? Object.values(d.horizons).reduce((s, h) => s + h.accuracy * h.n, 0) / Object.values(d.horizons).reduce((s, h) => s + h.n, 0) : null;
-  let avgMCE = Object.keys(d.calibration_curve).length > 0 ? Object.values(d.calibration_curve).reduce((s, c) => s + c.mce, 0) / Object.keys(d.calibration_curve).length : null;
-  const conv70 = Object.values(d.conviction);
-  const acc70 = conv70.length > 0 ? conv70.reduce((s, c) => s + c.accuracy * c.n, 0) / conv70.reduce((s, c) => s + c.n, 0) : null;
+  const acc = d.accuracy ? d.accuracy.value : null;
+  const evBps = d.economic ? d.economic.ev_per_trade_bps : null;
+  const totalPnlBps = d.economic ? d.economic.total_pnl_bps : null;
+  const totalPnlRaw = d.economic ? d.economic.total_pnl : null;
 
-  // Verdict
   let verdict = 'wait', verdictText = 'Collecting data...';
   if (d.resolved >= 50) {
-    if (overallAcc >= 0.54 && (avgMCE == null || avgMCE <= 0.05)) {
-      verdict = 'pass'; verdictText = 'Model is performing as expected';
-    } else if (overallAcc < 0.50 || (avgMCE != null && avgMCE > 0.08)) {
-      verdict = 'fail'; verdictText = 'Model performance below expectations — investigate';
-    } else {
-      verdict = 'wait'; verdictText = 'Borderline — need more data';
-    }
+    if (acc >= 0.55) { verdict = 'pass'; verdictText = 'Model performing as expected'; }
+    else if (acc < 0.50) { verdict = 'fail'; verdictText = 'Model underperforming -- investigate'; }
+    else { verdict = 'wait'; verdictText = 'Borderline -- need more data'; }
   }
 
   kpi.innerHTML = `
-    <div class="kpi"><div class="kpi-value ${accClass(overallAcc)}">${overallAcc != null ? fmt(overallAcc) : '--'}</div><div class="kpi-label">Overall Accuracy</div></div>
-    <div class="kpi"><div class="kpi-value ${avgMCE != null ? mceClass(avgMCE) : 'neutral'}">${avgMCE != null ? (avgMCE * 100).toFixed(1) + '%' : '--'}</div><div class="kpi-label">Avg MCE (calibration error)</div></div>
-    <div class="kpi"><div class="kpi-value" style="color:#58a6ff">${d.resolved}</div><div class="kpi-label">Resolved Predictions</div></div>
-    <div class="kpi"><div class="kpi-value ${acc70 != null ? accClass(acc70) : 'neutral'}">${acc70 != null ? fmt(acc70) : '--'}</div><div class="kpi-label">Accuracy (p>=70%)</div></div>
+    <div class="kpi"><div class="kpi-value ${acc != null ? accClass(acc) : 'neutral'}">${acc != null ? fmt(acc) : '--'}</div><div class="kpi-label">Win Rate (tradeable)</div></div>
+    <div class="kpi"><div class="kpi-value ${evBps != null && evBps > 0 ? 'good' : evBps != null ? 'bad' : 'neutral'}">${evBps != null ? evBps.toFixed(1) + ' bps' : '--'}</div><div class="kpi-label">EV / Trade</div></div>
+    <div class="kpi"><div class="kpi-value ${totalPnlBps != null && totalPnlBps > 0 ? 'good' : totalPnlBps != null ? 'bad' : 'neutral'}">${totalPnlBps != null ? totalPnlBps.toFixed(0) + ' bps' : '--'}</div><div class="kpi-label">Cumulative PnL</div></div>
+    <div class="kpi"><div class="kpi-value ${totalPnlRaw != null && totalPnlRaw > 0 ? 'good' : totalPnlRaw != null ? 'bad' : 'neutral'}">${totalPnlRaw != null ? totalPnlRaw.toFixed(4) : '--'}</div><div class="kpi-label">Total PnL (log return)</div></div>
   `;
 
   const grid = document.getElementById('grid');
   grid.innerHTML = '';
 
-  // Verdict card
+  // Verdict
   grid.innerHTML += `<div class="card full-width"><div class="verdict ${verdict}">${verdictText}${d.resolved < 50 ? ' (' + d.resolved + '/50 resolved)' : ''}</div></div>`;
 
-  // Horizon accuracy table
-  let hTable = '<table><tr><th>Horizon</th><th>N</th><th>Accuracy</th><th>Avg Prob</th><th>MCE</th><th>Status</th></tr>';
-  for (const h of HORIZONS) {
-    const hd = d.horizons[h];
-    const cal = d.calibration_curve[h];
-    if (!hd) { hTable += `<tr><td>${h}</td><td colspan="5" class="neutral">No data</td></tr>`; continue; }
-    const mce = cal ? cal.mce : null;
-    const status = hd.n < 20 ? '<span class="neutral">collecting</span>' : (hd.accuracy >= 0.54 ? '<span class="good">OK</span>' : '<span class="bad">CHECK</span>');
-    hTable += `<tr><td>${h}</td><td>${hd.n}</td><td class="${accClass(hd.accuracy)}">${fmt(hd.accuracy)}</td><td>${fmt(hd.avg_probability)}</td><td class="${mce != null ? mceClass(mce) : 'neutral'}">${mce != null ? fmt(mce) : '--'}</td><td>${status}</td></tr>`;
-  }
-  hTable += '</table>';
-  grid.innerHTML += `<div class="card"><h2>Accuracy by Horizon</h2>${hTable}</div>`;
-
-  // Pair breakdown table
-  let pTable = '<table><tr><th>Pair</th><th>N</th><th>Accuracy</th>';
-  for (const h of HORIZONS) pTable += `<th>${h}</th>`;
-  pTable += '</tr>';
-  for (const [pair, pd] of Object.entries(d.pairs).sort((a,b) => b[1].accuracy - a[1].accuracy)) {
-    pTable += `<tr><td>${pair}</td><td>${pd.n}</td><td class="${accClass(pd.accuracy)}">${fmt(pd.accuracy)}</td>`;
-    for (const h of HORIZONS) {
-      const ph = pd.horizons[h];
-      pTable += ph ? `<td class="${accClass(ph.accuracy)}">${fmt(ph.accuracy)}</td>` : '<td class="neutral">--</td>';
+  // Accuracy by meta threshold
+  if (d.by_threshold.length > 0) {
+    let tTable = '<table><tr><th>Threshold</th><th>Win Rate</th><th>EV/Trade</th><th>Total PnL</th><th>Avg Move</th><th>Trades</th></tr>';
+    for (const t of d.by_threshold) {
+      const evC = t.ev_bps > 0 ? 'good' : 'bad';
+      const pnlC = t.total_pnl > 0 ? 'good' : 'bad';
+      const highlight = t.threshold === 0.55 ? ' style="background:#58a6ff10"' : '';
+      tTable += `<tr${highlight}><td>P > ${t.threshold.toFixed(2)}</td><td class="${accClass(t.accuracy)}">${fmt(t.accuracy)}</td><td class="${evC}">${t.ev_bps.toFixed(1)} bps</td><td class="${pnlC}">${(t.total_pnl * 10000).toFixed(0)} bps</td><td>${t.avg_move_bps.toFixed(1)} bps</td><td>${t.count}</td></tr>`;
     }
-    pTable += '</tr>';
+    tTable += '</table>';
+    grid.innerHTML += `<div class="card"><h2>Performance by Meta Threshold</h2>${tTable}</div>`;
   }
-  pTable += '</table>';
-  grid.innerHTML += `<div class="card"><h2>Accuracy by Pair</h2>${pTable}</div>`;
 
-  // Calibration curve chart
-  grid.innerHTML += '<div class="card"><h2>Reliability Diagram</h2><div class="chart-container"><canvas id="calChart"></canvas></div></div>';
-
-  // Confidence distribution chart
-  grid.innerHTML += '<div class="card"><h2>Confidence Distribution</h2><div class="chart-container"><canvas id="confChart"></canvas></div></div>';
-
-  // Daily accuracy trend
-  grid.innerHTML += '<div class="card full-width"><h2>Daily Accuracy Trend</h2><div class="chart-container"><canvas id="dailyChart"></canvas></div></div>';
-
-  // Economic value table
-  let eTable = '<table><tr><th>Horizon</th><th>Win Rate</th><th>Avg Move</th><th>EV%</th><th>N (p>=65%)</th></tr>';
-  for (const h of HORIZONS) {
-    const e = d.economic[h];
-    if (!e) continue;
-    const evClass = e.ev_pct > 0 ? 'good' : 'bad';
-    eTable += `<tr><td>${h}</td><td class="${accClass(e.win_rate)}">${fmt(e.win_rate)}</td><td>${e.avg_move_pct.toFixed(4)}%</td><td class="${evClass}">${e.ev_pct.toFixed(4)}%</td><td>${e.n}</td></tr>`;
+  // Pair breakdown
+  if (Object.keys(d.pairs).length > 0) {
+    let pTable = '<table><tr><th>Pair</th><th>N</th><th>Win Rate</th><th>EV/Trade</th><th>Total PnL</th></tr>';
+    for (const [pair, pd] of Object.entries(d.pairs).sort((a,b) => b[1].total_pnl - a[1].total_pnl)) {
+      const pnlC = pd.total_pnl > 0 ? 'good' : 'bad';
+      pTable += `<tr><td>${pair}</td><td>${pd.n}</td><td class="${accClass(pd.accuracy)}">${fmt(pd.accuracy)}</td><td class="${pd.ev_bps > 0 ? 'good' : 'bad'}">${pd.ev_bps.toFixed(1)} bps</td><td class="${pnlC}">${(pd.total_pnl * 10000).toFixed(0)} bps</td></tr>`;
+    }
+    pTable += '</table>';
+    grid.innerHTML += `<div class="card"><h2>Performance by Pair</h2>${pTable}</div>`;
   }
-  eTable += '</table>';
 
-  // Accuracy by probability threshold
-  let tTable = '<table><tr><th>Horizon</th><th>Threshold</th><th>Accuracy</th><th>N</th></tr>';
-  for (const h of HORIZONS) {
-    const hd = d.horizons[h];
-    const c70 = d.conviction[h];
-    if (!hd) continue;
-    tTable += `<tr><td>${h}</td><td>All</td><td class="${accClass(hd.accuracy)}">${fmt(hd.accuracy)}</td><td>${hd.n}</td></tr>`;
-    if (c70) tTable += `<tr><td></td><td>p&gt;=70%</td><td class="${accClass(c70.accuracy)}">${fmt(c70.accuracy)}</td><td>${c70.n}</td></tr>`;
+  // Daily charts
+  if (d.daily_accuracy.length > 0) {
+    grid.innerHTML += '<div class="card full-width"><h2>Daily Win Rate</h2><div class="chart-container"><canvas id="dailyChart"></canvas></div></div>';
+    grid.innerHTML += '<div class="card full-width"><h2>Cumulative PnL (bps)</h2><div class="chart-container"><canvas id="pnlChart"></canvas></div></div>';
   }
-  tTable += '</table>';
 
-  grid.innerHTML += `<div class="card"><h2>Economic Value (p >= 65%)</h2>${eTable}</div>`;
-  grid.innerHTML += `<div class="card"><h2>Accuracy by Threshold</h2>${tTable}</div>`;
+  // Economic
+  if (d.economic && d.economic.n > 0) {
+    const e = d.economic;
+    const evClass = e.ev_per_trade_bps > 0 ? 'good' : 'bad';
+    const pnlClass = e.total_pnl_bps > 0 ? 'good' : 'bad';
+    grid.innerHTML += `<div class="card"><h2>Economic Value</h2>
+      <table>
+        <tr><td>Win Rate</td><td class="${accClass(e.win_rate)}">${fmt(e.win_rate)}</td></tr>
+        <tr><td>Avg |Move|</td><td>${e.avg_move_bps.toFixed(1)} bps</td></tr>
+        <tr><td>EV / Trade</td><td class="${evClass}">${e.ev_per_trade_bps.toFixed(1)} bps</td></tr>
+        <tr><td>Total PnL</td><td class="${pnlClass}">${e.total_pnl_bps.toFixed(0)} bps</td></tr>
+        <tr><td>Trades</td><td>${e.n}</td></tr>
+      </table>
+    </div>`;
+  }
 
-  // ── Prediction Explorer ──
+  // Prediction Explorer
   grid.innerHTML += `<div class="card full-width">
     <h2>Prediction Explorer</h2>
     <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:14px;">
       <select id="expPair" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:13px;">
         <option value="">All Pairs</option>
-        <option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option><option>USDCHF</option><option>AUDUSD</option><option>USDCAD</option><option>NZDUSD</option>
-      </select>
-      <select id="expHorizon" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:13px;">
-        <option value="">All Horizons</option>
-        <option>1H</option><option>4H</option><option>1D</option>
+        ${Object.keys(d.pairs || {}).map(p => '<option>' + p + '</option>').join('')}
       </select>
       <select id="expResolved" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:13px;">
         <option value="">All</option>
         <option value="true">Resolved</option>
         <option value="false">Pending</option>
+      </select>
+      <select id="expTradeable" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:13px;">
+        <option value="">All</option>
+        <option value="true">Tradeable</option>
+        <option value="false">Non-tradeable</option>
       </select>
       <button class="refresh-btn" onclick="loadPredictions()">Load</button>
     </div>
@@ -1364,125 +1228,86 @@ function render(d) {
   </div>`;
   loadPredictions();
 
-  // ── Render charts ──
-  Object.values(charts).forEach(c => c.destroy());
-  charts = {};
+  // Render charts
+  if (d.daily_accuracy.length > 0) {
+    // Win rate chart
+    const dailyCtx = document.getElementById('dailyChart').getContext('2d');
+    new Chart(dailyCtx, {
+      type: 'line',
+      data: {
+        labels: d.daily_accuracy.map(x => x.date),
+        datasets: [
+          {
+            label: 'Win Rate',
+            data: d.daily_accuracy.map(x => x.accuracy * 100),
+            borderColor: '#58a6ff',
+            backgroundColor: '#58a6ff20',
+            fill: true,
+            tension: 0.3,
+          },
+          {
+            label: '50% baseline',
+            data: d.daily_accuracy.map(() => 50),
+            borderColor: '#f8514950',
+            borderDash: [2,4],
+            pointRadius: 0,
+          },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+          x: { grid: { color: '#21262d' }, ticks: { color: '#7d8590', maxTicksLimit: 14 } },
+          y: { title: { display: true, text: 'Win Rate %', color: '#7d8590' }, min: 30, max: 80, grid: { color: '#21262d' }, ticks: { color: '#7d8590' } },
+        },
+        plugins: { legend: { labels: { color: '#c9d1d9' } } },
+      },
+    });
 
-  // Calibration curve
-  const calCtx = document.getElementById('calChart').getContext('2d');
-  const calDatasets = [];
-  for (const h of HORIZONS) {
-    const cal = d.calibration_curve[h];
-    if (!cal) continue;
-    calDatasets.push({
-      label: h,
-      data: cal.points.map(p => ({ x: p.predicted * 100, y: p.actual * 100 })),
-      borderColor: COLORS[h],
-      backgroundColor: COLORS[h] + '40',
-      pointRadius: 5,
-      showLine: true,
-      tension: 0.1,
+    // Cumulative PnL chart
+    const pnlCtx = document.getElementById('pnlChart').getContext('2d');
+    new Chart(pnlCtx, {
+      type: 'line',
+      data: {
+        labels: d.daily_accuracy.map(x => x.date),
+        datasets: [
+          {
+            label: 'Cumulative PnL (bps)',
+            data: d.daily_accuracy.map(x => x.cum_pnl_bps),
+            borderColor: '#3fb950',
+            backgroundColor: '#3fb95020',
+            fill: true,
+            tension: 0.3,
+          },
+          {
+            label: 'Daily PnL (bps)',
+            data: d.daily_accuracy.map(x => x.daily_pnl_bps),
+            borderColor: '#58a6ff80',
+            type: 'bar',
+            backgroundColor: d.daily_accuracy.map(x => x.daily_pnl_bps >= 0 ? '#3fb95060' : '#f8514960'),
+          },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+          x: { grid: { color: '#21262d' }, ticks: { color: '#7d8590', maxTicksLimit: 14 } },
+          y: { title: { display: true, text: 'PnL (bps)', color: '#7d8590' }, grid: { color: '#21262d' }, ticks: { color: '#7d8590' } },
+        },
+        plugins: { legend: { labels: { color: '#c9d1d9' } } },
+      },
     });
   }
-  calDatasets.push({
-    label: 'Perfect',
-    data: [{x:50,y:50},{x:100,y:100}],
-    borderColor: '#30363d',
-    borderDash: [5,5],
-    pointRadius: 0,
-    showLine: true,
-  });
-  charts.cal = new Chart(calCtx, {
-    type: 'scatter',
-    data: { datasets: calDatasets },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      scales: {
-        x: { title: { display: true, text: 'Predicted Probability %', color: '#7d8590' }, min: 50, max: 100, grid: { color: '#21262d' }, ticks: { color: '#7d8590' } },
-        y: { title: { display: true, text: 'Actual Accuracy %', color: '#7d8590' }, min: 30, max: 100, grid: { color: '#21262d' }, ticks: { color: '#7d8590' } },
-      },
-      plugins: { legend: { labels: { color: '#c9d1d9' } } },
-    },
-  });
-
-  // Confidence distribution
-  const confCtx = document.getElementById('confChart').getContext('2d');
-  const confDatasets = [];
-  for (const h of HORIZONS) {
-    const cd = d.confidence_distribution[h];
-    if (!cd) continue;
-    confDatasets.push({
-      label: h,
-      data: cd.map(b => b.count),
-      backgroundColor: COLORS[h] + '80',
-      borderColor: COLORS[h],
-      borderWidth: 1,
-    });
-  }
-  const confLabels = d.confidence_distribution[HORIZONS.find(h => d.confidence_distribution[h])]?.map(b => b.range) || [];
-  charts.conf = new Chart(confCtx, {
-    type: 'bar',
-    data: { labels: confLabels, datasets: confDatasets },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      scales: {
-        x: { grid: { color: '#21262d' }, ticks: { color: '#7d8590' } },
-        y: { title: { display: true, text: 'Count', color: '#7d8590' }, grid: { color: '#21262d' }, ticks: { color: '#7d8590' } },
-      },
-      plugins: { legend: { labels: { color: '#c9d1d9' } } },
-    },
-  });
-
-  // Daily accuracy trend
-  const dailyCtx = document.getElementById('dailyChart').getContext('2d');
-  charts.daily = new Chart(dailyCtx, {
-    type: 'line',
-    data: {
-      labels: d.daily_accuracy.map(x => x.date),
-      datasets: [
-        {
-          label: 'Accuracy',
-          data: d.daily_accuracy.map(x => x.accuracy * 100),
-          borderColor: '#58a6ff',
-          backgroundColor: '#58a6ff20',
-          fill: true,
-          tension: 0.3,
-        },
-        {
-          label: 'Avg Predicted Prob',
-          data: d.daily_accuracy.map(x => x.avg_probability * 100),
-          borderColor: '#f0883e',
-          borderDash: [4,4],
-          tension: 0.3,
-        },
-        {
-          label: '50% baseline',
-          data: d.daily_accuracy.map(() => 50),
-          borderColor: '#f8514950',
-          borderDash: [2,4],
-          pointRadius: 0,
-        },
-      ],
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      scales: {
-        x: { grid: { color: '#21262d' }, ticks: { color: '#7d8590', maxTicksLimit: 14 } },
-        y: { title: { display: true, text: 'Accuracy %', color: '#7d8590' }, min: 30, max: 80, grid: { color: '#21262d' }, ticks: { color: '#7d8590' } },
-      },
-      plugins: { legend: { labels: { color: '#c9d1d9' } } },
-    },
-  });
 }
 
 async function loadPredictions() {
   const pair = document.getElementById('expPair')?.value || '';
-  const horizon = document.getElementById('expHorizon')?.value || '';
   const resolved = document.getElementById('expResolved')?.value || '';
+  const tradeable = document.getElementById('expTradeable')?.value || '';
   const params = new URLSearchParams();
   if (pair) params.set('pair', pair);
-  if (horizon) params.set('horizon', horizon);
   if (resolved) params.set('resolved', resolved);
+  if (tradeable) params.set('tradeable', tradeable);
   params.set('limit', '50');
   const container = document.getElementById('expTable');
   if (!container) return;
@@ -1494,17 +1319,18 @@ async function loadPredictions() {
       container.innerHTML = '<div class="neutral" style="padding:12px;">No predictions found.</div>';
       return;
     }
-    let t = '<table><tr><th>Pair</th><th>Horizon</th><th>Dir</th><th>Prob</th><th>Logged</th><th>Maturity</th><th>Result</th><th>Return</th></tr>';
+    let t = '<table><tr><th>Pair</th><th>Dir</th><th>Meta P</th><th>Q50</th><th>Trade</th><th>Logged</th><th>Result</th><th>Return</th></tr>';
     for (const p of data.predictions) {
       const isResolved = p.resolved_at != null;
       const resultCell = !isResolved
         ? '<span class="neutral">Pending</span>'
         : p.correct === null
-          ? '<span class="neutral">No signal</span>'
+          ? '<span class="neutral">--</span>'
           : `<span class="${p.correct ? 'good' : 'bad'}">${p.correct ? 'Correct' : 'Wrong'}</span>`;
-      const retCell = isResolved ? (p.actual_return != null ? p.actual_return.toFixed(4) + '%' : '--') : '--';
-      const dir = p.direction === 'bullish' ? '<span class="good">UP</span>' : p.direction === 'bearish' ? '<span class="bad">DOWN</span>' : '<span class="neutral">FLAT</span>';
-      t += `<tr><td>${p.pair}</td><td>${p.horizon}</td><td>${dir}</td><td>${(p.probability*100).toFixed(1)}%</td><td>${p.logged_at?.slice(0,16)||'--'}</td><td>${p.matures_at?.slice(0,16)||'--'}</td><td>${resultCell}</td><td>${retCell}</td></tr>`;
+      const retCell = isResolved && p.actual_return != null ? (p.actual_return * 10000).toFixed(1) + ' bps' : '--';
+      const dir = p.direction === 'bullish' ? '<span class="good">UP</span>' : p.direction === 'bearish' ? '<span class="bad">DOWN</span>' : '<span class="neutral">--</span>';
+      const tradeCell = p.is_tradeable ? '<span class="good">YES</span>' : '<span class="neutral">no</span>';
+      t += `<tr><td>${p.pair}</td><td>${dir}</td><td>${(p.meta_proba*100).toFixed(1)}%</td><td>${(p.q50*10000).toFixed(1)}</td><td>${tradeCell}</td><td>${p.logged_at?.slice(0,16)||'--'}</td><td>${resultCell}</td><td>${retCell}</td></tr>`;
     }
     t += '</table>';
     container.innerHTML = `<div style="font-size:12px;color:#7d8590;margin-bottom:6px;">${data.count} predictions</div>` + t;
@@ -1514,16 +1340,16 @@ async function loadPredictions() {
 }
 
 loadData();
-setInterval(loadData, 5 * 60 * 1000);  // Auto-refresh every 5 min
+setInterval(loadData, 5 * 60 * 1000);
 </script>
 </body>
 </html>"""
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# -- CLI --
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='LumenY Paper Trading Tracker')
+    parser = argparse.ArgumentParser(description='LumenY Paper Trading v5.1')
     parser.add_argument('command', choices=['setup', 'log', 'resolve', 'report', 'run'])
     args = parser.parse_args()
 
@@ -1551,12 +1377,9 @@ if __name__ == '__main__':
         setup_db()
 
         async def _start():
-            # Start the monitoring API server in the background
             config = uvicorn.Config(monitor_app, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), log_level='info')
             server = uvicorn.Server(config)
             asyncio.create_task(server.serve())
-
-            # Run the paper trading loop
             await run_loop()
 
         asyncio.run(_start())

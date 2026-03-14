@@ -1,13 +1,37 @@
 """
-Feature engineering v5.1 — 64 microstructure features from 1-min OHLCV.
-Exact replica of notebooks_5.1/02_microstructure_features.ipynb.
+Live Backtest v5.1 — 15-pair model (7 majors + 8 crosses)
+
+Fetches the last ~100 days of 1-minute data from Polygon.io,
+computes microstructure features, runs Q50 + meta-model predictions,
+and simulates trades hour by hour.
+
+No leakage: each hour uses only data available at that point in time.
+Models were trained on data before 2024-06-30.
 """
 
-import numpy as np
+import os
+import asyncio
+import time
 import pandas as pd
+import numpy as np
+import joblib
+import httpx
+import warnings
+from pathlib import Path
+from datetime import datetime, timedelta
 from scipy import stats
 from math import lgamma
 
+warnings.filterwarnings('ignore')
+
+# ──────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
+
+API_KEY = os.getenv('POLYGON_S3_SECRET_KEY', '')
+REST_BASE = 'https://api.polygon.io'
 
 PAIRS = [
     # Majors
@@ -16,15 +40,108 @@ PAIRS = [
     'EURJPY', 'GBPJPY', 'EURGBP', 'EURAUD', 'AUDJPY', 'CADJPY', 'CHFJPY', 'AUDNZD',
 ]
 
+MODELS_DIR = Path('backend/models_5.1/3_quants')
+META_DIR   = Path('backend/models_5.1/meta')
 
-def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    return df.resample(rule).agg({
-        'open': 'first', 'high': 'max', 'low': 'min',
-        'close': 'last', 'volume': 'sum',
-    }).dropna()
+AVG_SPREAD = 0.00028
+MIN_Q50_THRESHOLD = AVG_SPREAD * 0.5
+
+# Fetch 100 days: 90 for backtest + 10 for trailing features warmup
+BACKTEST_DAYS = 90
+WARMUP_DAYS = 10
+TOTAL_FETCH_DAYS = BACKTEST_DAYS + WARMUP_DAYS
+
+# Meta-model thresholds to evaluate
+META_THRESHOLDS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+
+print(f'Live Backtest v5.1 — 15-pair model')
+print(f'  API key: {"OK" if API_KEY else "MISSING"}')
+print(f'  Pairs: {len(PAIRS)}')
+print(f'  Fetch window: {TOTAL_FETCH_DAYS} days ({WARMUP_DAYS} warmup + {BACKTEST_DAYS} backtest)')
 
 
-# ── Microstructure feature functions ──────────────────────────────────────
+# ──────────────────────────────────────────────
+# DATA FETCHING
+# ──────────────────────────────────────────────
+async def fetch_bars(pair, multiplier, timespan, from_date, to_date, limit=50000):
+    """Fetch OHLCV bars from Polygon REST API with pagination."""
+    ticker = f'C:{pair}'
+    url = f'{REST_BASE}/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}'
+    params = {'apiKey': API_KEY, 'limit': limit, 'sort': 'asc'}
+    all_results = []
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        all_results.extend(data.get('results', []))
+
+        while 'next_url' in data:
+            next_url = data['next_url']
+            sep = '&' if '?' in next_url else '?'
+            resp = await client.get(f'{next_url}{sep}apiKey={API_KEY}')
+            resp.raise_for_status()
+            data = resp.json()
+            all_results.extend(data.get('results', []))
+
+    if not all_results:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_results)
+    df['datetime'] = pd.to_datetime(df['t'], unit='ms', utc=True).dt.tz_localize(None)
+    df = df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'})
+    df = df.set_index('datetime')[['open', 'high', 'low', 'close', 'volume']]
+    df = df.sort_index().drop_duplicates()
+
+    # Filter weekends
+    df = df[~((df.index.dayofweek == 5) | ((df.index.dayofweek == 6) & (df.index.hour < 21)))]
+    return df
+
+
+async def fetch_all_pairs():
+    """Fetch 1-min data for all pairs."""
+    now = datetime.utcnow()
+    to_date = now.strftime('%Y-%m-%d')
+    from_date = (now - timedelta(days=TOTAL_FETCH_DAYS)).strftime('%Y-%m-%d')
+
+    print(f'\nFetching data from {from_date} to {to_date}...')
+    data = {}
+
+    for pair in PAIRS:
+        print(f'  {pair}...', end=' ', flush=True)
+        t0 = time.time()
+        df_1m = await fetch_bars(pair, 1, 'minute', from_date, to_date)
+        elapsed = time.time() - t0
+
+        if df_1m.empty:
+            print(f'NO DATA')
+            continue
+
+        # Resample to 5m and 15m
+        df_5m = df_1m.resample('5min').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+        }).dropna()
+        df_15m = df_1m.resample('15min').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+        }).dropna()
+        df_1h = df_1m.resample('1h').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+        }).dropna()
+
+        data[pair] = {
+            '1m': df_1m, '5m': df_5m, '15m': df_15m, '1h': df_1h
+        }
+        print(f'{len(df_1m):,} bars ({elapsed:.1f}s) | {df_1m.index.min().date()} to {df_1m.index.max().date()}')
+
+        await asyncio.sleep(0.5)  # rate limit
+
+    return data
+
+
+# ──────────────────────────────────────────────
+# MICROSTRUCTURE FEATURE FUNCTIONS
+# (exact replica from notebooks_5/01_microstructure_features.ipynb)
+# ──────────────────────────────────────────────
 
 def realized_vol_estimators(o, h, l, c):
     n = len(o)
@@ -450,7 +567,6 @@ def cross_timeframe_features(returns_1m, returns_5m, returns_15m):
 
 
 def compute_hour_features(df_1m_hour, df_5m_hour, df_15m_hour, rolling_sigma=None):
-    """Compute all microstructure features for one hour of 1-min data."""
     if len(df_1m_hour) < 5:
         return None, None
     o = df_1m_hour['open'].values
@@ -478,7 +594,6 @@ def compute_hour_features(df_1m_hour, df_5m_hour, df_15m_hour, rolling_sigma=Non
 
 
 def compute_trailing_features(df_hourly, returns_1m_dict):
-    """Compute trailing/rolling features across multiple hours."""
     n = len(df_hourly)
     hurst_values = np.full(n, np.nan)
     fractal_values = np.full(n, np.nan)
@@ -521,12 +636,16 @@ def compute_trailing_features(df_hourly, returns_1m_dict):
     return df_hourly
 
 
-def compute_features_for_pair(pair, df_1m, df_5m, df_15m):
-    """
-    Compute microstructure features for one pair from OHLCV data.
-    Returns a DataFrame indexed by hour timestamps with all 64 features.
-    """
-    df_1m = df_1m.copy()
+# ──────────────────────────────────────────────
+# FEATURE PIPELINE
+# ──────────────────────────────────────────────
+def compute_features_for_pair(pair, data):
+    """Compute microstructure features for one pair from fetched data."""
+    df_1m = data[pair]['1m']
+    df_5m = data[pair]['5m']
+    df_15m = data[pair]['15m']
+    df_1h = data[pair]['1h']
+
     df_1m['hour'] = df_1m.index.floor('h')
     hours = sorted(df_1m['hour'].unique())
 
@@ -562,7 +681,243 @@ def compute_features_for_pair(pair, df_1m, df_5m, df_15m):
     df_features = compute_trailing_features(df_features, returns_1m_dict)
     df_features['pair'] = pair
 
+    # Compute labels from 1H closes (for measuring actual outcomes)
+    close_1h = df_1h['close'].reindex(df_features.index, method='ffill')
+    close_1h_next = df_1h['close'].shift(-1).reindex(df_features.index, method='ffill')
+    df_features['label_1H'] = np.log(close_1h_next / close_1h)
+
+    # Also store entry/exit prices
+    df_features['entry_price'] = close_1h
+    df_features['exit_price'] = close_1h_next
+
     float_cols = df_features.select_dtypes(include=[np.float64]).columns
     df_features[float_cols] = df_features[float_cols].astype(np.float32)
 
     return df_features
+
+
+# ──────────────────────────────────────────────
+# MODEL INFERENCE
+# ──────────────────────────────────────────────
+def run_inference(df_all):
+    """Run Q25/Q50/Q75 + meta-model on feature data."""
+
+    # Load models — all quantile models are in 3_quants/ for v5.1
+    q50_bundle = joblib.load(MODELS_DIR / 'model_1H_Q50.joblib')
+    q25_bundle = joblib.load(MODELS_DIR / 'model_1H_Q25.joblib')
+    q75_bundle = joblib.load(MODELS_DIR / 'model_1H_Q75.joblib')
+    meta_bundle = joblib.load(META_DIR / 'meta_confidence.joblib')
+
+    feature_cols = q50_bundle['feature_cols']
+    meta_feature_cols = meta_bundle['meta_feature_cols']
+
+    # Prepare features
+    X = df_all[feature_cols].ffill().fillna(0)
+
+    # Q50/Q25/Q75 predictions
+    q50_pred = q50_bundle['model'].predict(X)
+    q25_pred = q25_bundle['model'].predict(X)
+    q75_pred = q75_bundle['model'].predict(X)
+
+    df_all['Q50'] = q50_pred
+    df_all['Q25'] = q25_pred
+    df_all['Q75'] = q75_pred
+    df_all['abs_Q50'] = np.abs(q50_pred)
+    df_all['pred_dir'] = np.sign(q50_pred)
+    df_all['actual_dir'] = np.sign(df_all['label_1H'])
+
+    # Meta-model features
+    df_all['Q50_oof'] = q50_pred  # named _oof to match meta_feature_cols
+    df_all['Q25_oof'] = q25_pred
+    df_all['Q75_oof'] = q75_pred
+    df_all['abs_Q50'] = np.abs(q50_pred)
+    df_all['iqr'] = q75_pred - q25_pred
+    df_all['conf_ratio'] = np.abs(q50_pred) / np.clip(df_all['iqr'], 1e-10, None)
+
+    # Filter tradeable hours and run meta-model
+    tradeable_mask = df_all['abs_Q50'] > MIN_Q50_THRESHOLD
+    df_tradeable = df_all[tradeable_mask].copy()
+
+    if len(df_tradeable) > 0:
+        X_meta = df_tradeable[meta_feature_cols].ffill().fillna(0)
+        meta_proba = meta_bundle['model'].predict_proba(X_meta)[:, 1]
+        df_all.loc[tradeable_mask, 'meta_proba'] = meta_proba
+    else:
+        df_all['meta_proba'] = np.nan
+
+    return df_all
+
+
+# ──────────────────────────────────────────────
+# TRADE SIMULATION
+# ──────────────────────────────────────────────
+def simulate_trades(df_all, backtest_start):
+    """Simulate trades and report results."""
+    # Only use backtest period (skip warmup)
+    df = df_all[df_all.index >= backtest_start].copy()
+    df = df[df['label_1H'].notna()].copy()
+
+    print(f'\n{"="*80}')
+    print(f'LIVE BACKTEST RESULTS')
+    print(f'{"="*80}')
+    print(f'Period: {df.index.min().date()} to {df.index.max().date()}')
+    n_days = (df.index.max() - df.index.min()).days
+    print(f'Duration: {n_days} days')
+    print(f'Total hours: {len(df):,}')
+    print(f'Pairs: {df["pair"].nunique()}')
+
+    # ── Q50-only baselines ──
+    print(f'\n--- Q50-Only Baselines ---')
+    print(f'{"Filter":<20} {"Trades":>8} {"Tr/day":>8} {"WR":>8} {"EV/trade":>12} {"TotalPnL":>10} {"Sharpe":>8}')
+    print('-' * 75)
+
+    for name, thresh in [('|Q50|>0.5x', AVG_SPREAD*0.5), ('|Q50|>1x', AVG_SPREAD),
+                         ('|Q50|>2x', AVG_SPREAD*2), ('|Q50|>3x', AVG_SPREAD*3)]:
+        mask = df['abs_Q50'] > thresh
+        n = mask.sum()
+        if n < 3:
+            continue
+        s = df[mask]
+        pnl = s['pred_dir'] * s['label_1H'] - AVG_SPREAD
+        wr = (s['pred_dir'] == s['actual_dir']).mean()
+        sharpe = (pnl.mean() / pnl.std()) * np.sqrt(252 * 24) if pnl.std() > 0 else 0
+        print(f'{name:<20} {n:>8,} {n/max(n_days,1):>8.2f} {wr:>7.1%} {pnl.mean():>12.6f} {pnl.sum():>10.4f} {sharpe:>8.2f}')
+
+    # ── Meta-model results ──
+    df_tradeable = df[df['meta_proba'].notna()].copy()
+    print(f'\n--- Meta-Model Results ---')
+    print(f'Tradeable hours (|Q50|>0.5x with meta score): {len(df_tradeable):,}')
+    if len(df_tradeable) > 0:
+        print(f'Meta probability: mean={df_tradeable["meta_proba"].mean():.3f}, '
+              f'median={df_tradeable["meta_proba"].median():.3f}')
+
+    print(f'\n{"Threshold":<12} {"Trades":>8} {"Tr/day":>8} {"WR":>8} {"EV/trade":>12} {"TotalPnL":>10} {"Sharpe":>8}')
+    print('-' * 75)
+
+    for thresh in META_THRESHOLDS:
+        mask = df_tradeable['meta_proba'] > thresh
+        n = mask.sum()
+        if n < 3:
+            continue
+        s = df_tradeable[mask]
+        pnl = s['pred_dir'] * s['label_1H'] - AVG_SPREAD
+        wr = (s['pred_dir'] == s['actual_dir']).mean()
+        sharpe = (pnl.mean() / pnl.std()) * np.sqrt(252 * 24) if pnl.std() > 0 else 0
+        flag = ' <<<' if wr >= 0.80 and n >= 10 else (' <<' if wr >= 0.70 else '')
+        print(f'P > {thresh:.2f}    {n:>8,} {n/max(n_days,1):>8.2f} {wr:>7.1%} {pnl.mean():>12.6f} {pnl.sum():>10.4f} {sharpe:>8.2f}{flag}')
+
+    # ── Strategy: take all trades where meta P > 0.50 ──
+    META_THRESH = 0.50
+    filtered = df_tradeable[df_tradeable['meta_proba'] > META_THRESH]
+    if len(filtered) > 0:
+        print(f'\n{"="*80}')
+        print(f'STRATEGY: Q50>0.5x spread + Meta P>{META_THRESH}')
+        print(f'{"="*80}')
+        filtered_copy = filtered.copy()
+        filtered_copy['pnl'] = filtered_copy['pred_dir'] * filtered_copy['label_1H'] - AVG_SPREAD
+        filtered_copy['correct'] = (filtered_copy['pred_dir'] == filtered_copy['actual_dir']).astype(int)
+
+        total_trades = len(filtered_copy)
+        total_wins = filtered_copy['correct'].sum()
+        total_pnl = filtered_copy['pnl'].sum()
+        total_wr = total_wins / total_trades
+        ev = filtered_copy['pnl'].mean()
+
+        print(f'\nTotal trades:  {total_trades}')
+        print(f'Wins / Losses: {total_wins} / {total_trades - total_wins}')
+        print(f'Win Rate:      {total_wr:.1%}')
+        print(f'EV per trade:  {ev:.6f}')
+        print(f'Total PnL:     {total_pnl:.4f}')
+        print(f'Trades/day:    {total_trades/max(n_days,1):.2f}')
+
+        # ── Per-pair breakdown ──
+        print(f'\n--- Per-Pair Breakdown ---')
+        print(f'{"Pair":<10} {"Trades":>8} {"Tr/day":>8} {"WR":>8} {"EV/trade":>12} {"TotalPnL":>10}')
+        print('-' * 60)
+        for pair in sorted(filtered_copy['pair'].unique()):
+            p = filtered_copy[filtered_copy['pair'] == pair]
+            wr = p['correct'].mean()
+            flag = ' <<<' if p['pnl'].mean() > 0 else ''
+            print(f'{pair:<10} {len(p):>8,} {len(p)/max(n_days,1):>8.2f} {wr:>7.1%} '
+                  f'{p["pnl"].mean():>12.6f} {p["pnl"].sum():>10.4f}{flag}')
+
+        # ── Day-by-day ──
+        print(f'\n--- Day-by-Day ---')
+        print(f'{"Date":<12} {"Trades":>8} {"Wins":>6} {"WR":>8} {"PnL":>10}')
+        print('-' * 50)
+        filtered_copy['date'] = filtered_copy.index.date
+
+        daily = filtered_copy.groupby('date').agg(
+            trades=('pnl', 'count'),
+            wins=('correct', 'sum'),
+            pnl=('pnl', 'sum')
+        )
+        cum_pnl = 0
+        for date, row in daily.iterrows():
+            wr = row['wins'] / row['trades'] if row['trades'] > 0 else 0
+            cum_pnl += row['pnl']
+            flag = ' <<<' if row['pnl'] > 0 else ''
+            print(f'{str(date):<12} {row["trades"]:>8} {row["wins"]:>6} {wr:>7.1%} {row["pnl"]:>10.4f}  cum:{cum_pnl:>10.4f}{flag}')
+
+        # ── Weekly summary ──
+        print(f'\n--- Weekly Summary ---')
+        filtered_copy['week'] = pd.to_datetime(filtered_copy['date']).dt.isocalendar().week.values
+        filtered_copy['year'] = pd.to_datetime(filtered_copy['date']).dt.isocalendar().year.values
+        filtered_copy['yearweek'] = filtered_copy['year'].astype(str) + '-W' + filtered_copy['week'].astype(str).str.zfill(2)
+        weekly = filtered_copy.groupby('yearweek').agg(
+            trades=('pnl', 'count'),
+            wins=('correct', 'sum'),
+            pnl=('pnl', 'sum')
+        )
+        print(f'{"Week":<12} {"Trades":>8} {"Wins":>6} {"WR":>8} {"PnL":>10}')
+        print('-' * 50)
+        for week, row in weekly.iterrows():
+            wr = row['wins'] / row['trades'] if row['trades'] > 0 else 0
+            flag = ' <<<' if row['pnl'] > 0 else ''
+            print(f'{week:<12} {row["trades"]:>8} {row["wins"]:>6} {wr:>7.1%} {row["pnl"]:>10.4f}{flag}')
+
+    return df
+
+
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
+async def main():
+    t_start = time.time()
+
+    # Step 1: Fetch data
+    data = await fetch_all_pairs()
+
+    # Step 2: Compute features
+    print(f'\nComputing microstructure features...')
+    all_dfs = []
+    for pair in PAIRS:
+        if pair not in data:
+            continue
+        print(f'  {pair}...', end=' ', flush=True)
+        t0 = time.time()
+        df_feat = compute_features_for_pair(pair, data)
+        elapsed = time.time() - t0
+        print(f'{len(df_feat):,} hours ({elapsed:.1f}s)')
+        all_dfs.append(df_feat)
+
+    df_all = pd.concat(all_dfs).sort_index()
+    print(f'Total feature rows: {len(df_all):,}')
+
+    # Step 3: Run inference
+    print(f'\nRunning model inference...')
+    df_all = run_inference(df_all)
+
+    # Step 4: Determine backtest start (skip warmup period)
+    backtest_start = df_all.index.min() + pd.Timedelta(days=WARMUP_DAYS)
+    print(f'Backtest starts: {backtest_start.date()} (after {WARMUP_DAYS} days warmup)')
+
+    # Step 5: Simulate and report
+    simulate_trades(df_all, backtest_start)
+
+    elapsed_total = time.time() - t_start
+    print(f'\nTotal runtime: {elapsed_total:.0f}s')
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

@@ -1,158 +1,112 @@
 """
-Model inference — loads 15 quantile models (v2, no calibrators),
-runs predictions, and derives raw probabilities.
-v2: trained on data <= 2024-06-30, no data leakage, no calibrators needed.
+Model inference v5.1 — 3 LightGBM quantile models (Q25/Q50/Q75)
++ 1 meta-model binary classifier for trade quality filtering.
+
+Direction = sign(Q50), trade quality = meta_proba.
 """
 
-import numpy as np
 import joblib
 from pathlib import Path
 
 MODELS_DIR = Path("/app/models")
 
-HORIZONS = ['1H', '4H', '1D']
-QUANTILES = [0.10, 0.25, 0.50, 0.75, 0.90]
-QUANTILE_NAMES = ['Q10', 'Q25', 'Q50', 'Q75', 'Q90']
+AVG_SPREAD = 0.00028        # ~2.8 pips average spread
+MIN_Q50_THRESHOLD = AVG_SPREAD * 0.5   # 0.00014
+META_THRESHOLD = 0.55        # walk-forward optimal
+
 
 class Predictor:
-    """Loads all models once, runs inference on demand."""
+    """Loads quantile + meta models once, runs inference on demand."""
 
     def __init__(self):
-        self.models = {}       # {(horizon, quantile_name): model}
+        self.quant_models = {}   # {'Q25': model, 'Q50': model, 'Q75': model}
+        self.meta_model = None
         self.feature_cols = None
+        self.meta_feature_cols = None
         self._load_models()
 
     def _load_models(self):
-        for horizon in HORIZONS:
-            for q, q_name in zip(QUANTILES, QUANTILE_NAMES):
-                path = MODELS_DIR / f'model_{horizon}_Q{int(q * 100)}.joblib'
-                bundle = joblib.load(path)
-                self.models[(horizon, q_name)] = bundle['model']
-                if self.feature_cols is None:
-                    self.feature_cols = bundle['feature_cols']
+        # Load 3 quantile models
+        for q_name in ['Q25', 'Q50', 'Q75']:
+            q_int = int(q_name[1:])
+            path = MODELS_DIR / f'model_1H_Q{q_int}.joblib'
+            bundle = joblib.load(path)
+            self.quant_models[q_name] = bundle['model']
+            if self.feature_cols is None:
+                self.feature_cols = bundle['feature_cols']
 
-    @staticmethod
-    def _derive_p_down(q_vals: np.ndarray) -> float:
-        """
-        Derive P(down) from 5 quantile predictions.
-        Exact replica of notebook 04 derive_p_down().
-        """
-        qs = np.array(QUANTILES)
-        vals = q_vals
-
-        if vals[0] <= 0 <= vals[-1]:
-            return float(np.interp(0, vals, qs))
-        elif vals[-1] < 0:
-            slope = (qs[-1] - qs[-2]) / (vals[-1] - vals[-2] + 1e-10)
-            p_down = qs[-1] + slope * (0 - vals[-1])
-            return float(np.clip(p_down, 0.90, 0.999))
-        else:
-            slope = (qs[1] - qs[0]) / (vals[1] - vals[0] + 1e-10)
-            p_down = qs[0] + slope * (0 - vals[0])
-            return float(np.clip(p_down, 0.001, 0.10))
+        # Load meta-model
+        meta_path = MODELS_DIR / 'meta_confidence.joblib'
+        meta_bundle = joblib.load(meta_path)
+        self.meta_model = meta_bundle['model']
+        self.meta_feature_cols = meta_bundle['meta_feature_cols']
 
     def predict(self, features_df, pair: str) -> dict:
         """
-        Run full inference for one pair across all horizons.
+        Run inference for one pair: 3 quantile predictions + meta probability.
+
+        Replicates the backtest logic exactly:
+        1. Run Q25/Q50/Q75 on microstructure features
+        2. Build derived columns (Q50_oof, Q25_oof, Q75_oof, abs_Q50, iqr, conf_ratio)
+        3. Run meta-model on microstructure features + derived columns
 
         Args:
-            features_df: DataFrame with all 208 features, at least 1 row.
-                         Uses the last row (most recent candle).
+            features_df: DataFrame with microstructure features, at least 1 row.
+                         Uses the last row (most recent hour).
             pair: e.g. "EURUSD"
 
         Returns:
-            dict with per-horizon predictions including calibrated probabilities.
+            dict with quantile predictions, direction, meta_proba, and trade signal.
         """
-        X = features_df[self.feature_cols].ffill().bfill()
+        X = features_df[self.feature_cols].ffill().fillna(0)
         latest = X.iloc[[-1]]
 
-        result = {'pair': pair, 'horizons': {}}
+        # Run 3 quantile models (no force-sort — matches backtest exactly)
+        q_preds = {}
+        for q_name in ['Q25', 'Q50', 'Q75']:
+            model = self.quant_models[q_name]
+            q_preds[q_name] = float(model.predict(latest)[0])
 
-        for horizon in HORIZONS:
-            # Run 5 quantile models
-            q_preds = {}
-            for q, q_name in zip(QUANTILES, QUANTILE_NAMES):
-                model = self.models[(horizon, q_name)]
-                q_preds[q_name] = float(model.predict(latest)[0])
+        q50 = q_preds['Q50']
+        q25 = q_preds['Q25']
+        q75 = q_preds['Q75']
 
-            q_vals_raw = np.array([q_preds[n] for n in QUANTILE_NAMES])
-
-            # Step 1: Force-sort to fix quantile crossing
-            q_vals = np.sort(q_vals_raw)
-            was_crossed = not np.array_equal(q_vals, q_vals_raw)
-
-            # Update q_preds with sorted values
-            for i, q_name in enumerate(QUANTILE_NAMES):
-                q_preds[q_name] = float(q_vals[i])
-
-            spread = float(q_vals[-1] - q_vals[0])
-
-            # Derive P(down) — v2 models are well-calibrated, no calibrator needed
-            cal_p_down = self._derive_p_down(q_vals)
-            cal_p_up = 1.0 - cal_p_down
-
-            # Direction and probability
-            if cal_p_down > cal_p_up:
-                direction = 'bearish'
-                probability = cal_p_down
-            else:
-                direction = 'bullish'
-                probability = cal_p_up
-
-            if probability < 0.55:
-                direction = 'neutral'
-
-            # Signal strength
-            if probability >= 0.80:
-                signal_strength = 'very_strong'
-            elif probability >= 0.70:
-                signal_strength = 'strong'
-            elif probability >= 0.60:
-                signal_strength = 'moderate'
-            else:
-                signal_strength = 'weak'
-
-            q50 = q_preds['Q50']
-
-            result['horizons'][horizon] = {
-                'direction': direction,
-                'probability': round(probability, 4),
-                'calibrated_p_down': round(cal_p_down, 4),
-                'calibrated_p_up': round(cal_p_up, 4),
-                'raw_p_down': round(cal_p_down, 4),
-                'signal_strength': signal_strength,
-                'expected_move_pct': round(q50 * 100, 4),
-                'quantile_spread': round(spread * 100, 6),
-                'quantiles': {
-                    'Q10': round(q_preds['Q10'] * 100, 4),
-                    'Q25': round(q_preds['Q25'] * 100, 4),
-                    'Q50': round(q_preds['Q50'] * 100, 4),
-                    'Q75': round(q_preds['Q75'] * 100, 4),
-                    'Q90': round(q_preds['Q90'] * 100, 4),
-                },
-                'cone': {
-                    'inner': [round(q_preds['Q25'] * 100, 4), round(q_preds['Q75'] * 100, 4)],
-                    'outer': [round(q_preds['Q10'] * 100, 4), round(q_preds['Q90'] * 100, 4)],
-                    'center': round(q50 * 100, 4),
-                },
-            }
-
-        # Horizon alignment (3 horizons: 1H, 4H, 1D)
-        directions = [result['horizons'][h]['direction'] for h in HORIZONS]
-        bullish_count = sum(1 for d in directions if d == 'bullish')
-        bearish_count = sum(1 for d in directions if d == 'bearish')
-        if bullish_count == 3:
-            alignment = 'strong_bullish'
-        elif bearish_count == 3:
-            alignment = 'strong_bearish'
-        elif bullish_count >= 2 and bearish_count == 0:
-            alignment = 'bullish'
-        elif bearish_count >= 2 and bullish_count == 0:
-            alignment = 'bearish'
-        elif bullish_count > 0 and bearish_count > 0:
-            alignment = 'conflict'
+        # Direction from sign of Q50
+        if q50 > 0:
+            direction = 'bullish'
+        elif q50 < 0:
+            direction = 'bearish'
         else:
-            alignment = 'neutral'
-        result['horizon_alignment'] = alignment
+            direction = 'neutral'
 
-        return result
+        abs_q50 = abs(q50)
+        iqr = q75 - q25
+
+        # Build meta-model input: microstructure features + derived quantile columns
+        # This replicates the backtest's run_inference() logic exactly
+        meta_row = latest.copy()
+        meta_row['Q50_oof'] = q50
+        meta_row['Q25_oof'] = q25
+        meta_row['Q75_oof'] = q75
+        meta_row['abs_Q50'] = abs_q50
+        meta_row['iqr'] = iqr
+        meta_row['conf_ratio'] = abs_q50 / max(iqr, 1e-10)
+
+        X_meta = meta_row[self.meta_feature_cols].fillna(0)
+        meta_proba = float(self.meta_model.predict_proba(X_meta)[0, 1])
+
+        # Trade signal: meta_proba above threshold AND |Q50| above minimum
+        # Strict > to match backtest exactly
+        is_tradeable = meta_proba > META_THRESHOLD and abs_q50 > MIN_Q50_THRESHOLD
+
+        return {
+            'pair': pair,
+            'direction': direction,
+            'q25': round(q25, 8),
+            'q50': round(q50, 8),
+            'q75': round(q75, 8),
+            'meta_proba': round(meta_proba, 4),
+            'is_tradeable': is_tradeable,
+            'abs_q50': round(abs_q50, 8),
+            'spread': round(iqr, 8),
+        }
