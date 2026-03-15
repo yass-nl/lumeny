@@ -561,13 +561,44 @@ def print_report():
 # -- Continuous loop --
 
 async def run_loop():
-    """Run log + resolve every hour indefinitely."""
+    """Run log + resolve + trade every hour indefinitely."""
+    from tradelocker_bot import get_bot
+
+    bot = get_bot()
+    if bot.is_enabled():
+        await bot.initialize()
+
     logger.info('Starting paper trading loop (every 60 minutes)...')
     while True:
         try:
             buf = await _init_buffer()
+
+            # 1. Close matured positions on TradeLocker
+            if bot.is_enabled():
+                await bot.close_matured_positions()
+
+            # 2. Resolve paper trading outcomes
             await resolve_outcomes()
+
+            # 3. Run inference and log predictions
             await log_predictions(buf)
+
+            # 4. Place trades for new tradeable signals
+            if bot.is_enabled():
+                conn = get_db()
+                # Get the latest tradeable predictions (logged in the last 5 minutes)
+                cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+                rows = conn.execute("""
+                    SELECT id, pair, direction, q50, meta_proba, is_tradeable, matures_at
+                    FROM predictions
+                    WHERE logged_at >= ? AND is_tradeable = 1
+                """, (cutoff,)).fetchall()
+                conn.close()
+
+                if rows:
+                    preds = [dict(r) for r in rows]
+                    await bot.place_trades(preds)
+
         except Exception as e:
             logger.error(f'Loop error: {e}', exc_info=True)
 
@@ -760,13 +791,20 @@ async def api_live_snapshot():
 
 @monitor_app.get('/api/monitor/health')
 async def api_health(_: None = Depends(_require_auth)):
+    from tradelocker_bot import get_bot
     conn = get_db()
     last_log = conn.execute("SELECT * FROM hourly_log ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
+    bot = get_bot()
     return {
         'status': 'ok',
         'db_path': str(DB_PATH),
         'last_log': dict(last_log) if last_log else None,
+        'tradelocker': {
+            'enabled': bot.is_enabled(),
+            'open_positions': len(bot.open_positions),
+            'instruments_mapped': len(bot.instrument_map),
+        },
     }
 
 
