@@ -50,6 +50,20 @@ MAX_CONCURRENT_POSITIONS = 5
 # How long to hold a position (hours)
 HOLD_HOURS = 4
 
+# TradeLocker API returns positions/orders as arrays, not dicts.
+# Column indices from /trade/config:
+POS_ID = 0
+POS_INSTRUMENT_ID = 1
+POS_ROUTE_ID = 2
+POS_SIDE = 3
+POS_QTY = 4
+POS_AVG_PRICE = 5
+
+# Orders history column indices
+ORD_ID = 0
+ORD_INSTRUMENT_ID = 1
+ORD_POSITION_ID = 16
+
 
 class TradeLockerBot:
     def __init__(self):
@@ -234,8 +248,11 @@ class TradeLockerBot:
                 logger.info('TradeLocker: no open positions to recover')
                 return
 
-            # Build reverse map: instrument_id -> pair
-            inst_to_pair = {v: k for k, v in self.instrument_map.items()}
+            # Build reverse map: instrument_id -> pair (both int and str keys)
+            inst_to_pair = {}
+            for k, v in self.instrument_map.items():
+                inst_to_pair[v] = k
+                inst_to_pair[str(v)] = k
 
             # Get unresolved tradeable predictions from DB
             import sqlite3
@@ -253,8 +270,14 @@ class TradeLockerBot:
 
             recovered = 0
             for pos in positions:
-                inst_id = str(pos.get('tradableInstrumentId', ''))
-                pos_id = pos.get('id') or pos.get('positionId')
+                # Positions come as arrays: [posId, instrumentId, routeId, side, qty, ...]
+                if isinstance(pos, list):
+                    pos_id = str(pos[POS_ID])
+                    inst_id = str(pos[POS_INSTRUMENT_ID])
+                else:
+                    inst_id = str(pos.get('tradableInstrumentId', ''))
+                    pos_id = str(pos.get('id') or pos.get('positionId'))
+
                 pair = inst_to_pair.get(inst_id) or inst_to_pair.get(int(inst_id) if inst_id.isdigit() else inst_id)
 
                 if pair and pair in unresolved:
@@ -262,13 +285,17 @@ class TradeLockerBot:
                     matures_at = datetime.fromisoformat(pred['matures_at'])
                     self.open_positions[pred['id']] = {
                         'order_id': None,
-                        'position_id': str(pos_id),
+                        'position_id': pos_id,
                         'pair': pair,
                         'side': None,
                         'close_at': matures_at,
                         'instrument_id': inst_id,
                     }
                     recovered += 1
+                    logger.info(
+                        f'TradeLocker: recovered {pair} positionId={pos_id}, '
+                        f'close_at={matures_at.isoformat()}'
+                    )
 
             if recovered:
                 logger.info(f'TradeLocker: recovered {recovered} open position(s) from restart')
@@ -308,6 +335,10 @@ class TradeLockerBot:
             pair = pred['pair']
             direction = pred['direction']
             pred_id = pred['id']
+
+            # Skip if already placed (e.g. from retry)
+            if pred_id in self.open_positions:
+                continue
 
             instrument_id = self.instrument_map.get(pair)
             if not instrument_id:
@@ -366,7 +397,16 @@ class TradeLockerBot:
             resp.raise_for_status()
             data = resp.json()
 
-        order_id = data.get('orderId') or data.get('id')
+        # Response may be nested: {'s': 'ok', 'd': {'orderId': ...}}
+        if isinstance(data, dict) and 'd' in data:
+            inner = data['d']
+        else:
+            inner = data
+        if isinstance(inner, dict):
+            order_id = inner.get('orderId') or inner.get('id')
+        else:
+            order_id = inner  # might be just the ID directly
+        logger.info(f'TradeLocker: order response: {data}')
         return order_id
 
     async def close_matured_positions(self):
@@ -436,12 +476,22 @@ class TradeLockerBot:
                 resp.raise_for_status()
                 data = resp.json()
 
-            orders = data.get('orders', data.get('d', {}).get('orders', []))
+            # Unwrap nested format
+            if isinstance(data, dict) and 'd' in data:
+                inner = data['d']
+            else:
+                inner = data
+            orders = inner if isinstance(inner, list) else inner.get('orders', []) if isinstance(inner, dict) else []
 
             # Build order_id -> position info lookup
             order_lookup = {}
-            if isinstance(orders, list):
-                for order in orders:
+            for order in orders:
+                if isinstance(order, list) and len(order) > ORD_POSITION_ID:
+                    oid = str(order[ORD_ID])
+                    posid = order[ORD_POSITION_ID]
+                    if oid and posid:
+                        order_lookup[oid] = str(posid)
+                elif isinstance(order, dict):
                     oid = order.get('orderId') or order.get('id')
                     posid = order.get('positionId')
                     if oid and posid:
@@ -470,11 +520,19 @@ class TradeLockerBot:
                 resp.raise_for_status()
                 data = resp.json()
 
-            positions = data.get('positions', data.get('d', {}).get('positions', []))
-            if isinstance(positions, list):
-                for pos in positions:
+            # Unwrap nested format
+            if isinstance(data, dict) and 'd' in data:
+                inner = data['d']
+            else:
+                inner = data
+            positions = inner if isinstance(inner, list) else inner.get('positions', []) if isinstance(inner, dict) else []
+            for pos in positions:
+                if isinstance(pos, list):
+                    if str(pos[POS_INSTRUMENT_ID]) == str(instrument_id):
+                        return str(pos[POS_ID])
+                elif isinstance(pos, dict):
                     if str(pos.get('tradableInstrumentId')) == str(instrument_id):
-                        return pos.get('id') or pos.get('positionId')
+                        return str(pos.get('id') or pos.get('positionId'))
 
         except Exception as e:
             logger.warning(f'TradeLocker: failed to find position by instrument: {e}')
@@ -527,7 +585,21 @@ class TradeLockerBot:
                 resp.raise_for_status()
                 data = resp.json()
 
-            return data.get('positions', data.get('d', {}).get('positions', []))
+            logger.info(f'TradeLocker: positions response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}')
+            # Unwrap nested format
+            if isinstance(data, dict) and 'd' in data:
+                inner = data['d']
+            else:
+                inner = data
+            if isinstance(inner, dict):
+                positions = inner.get('positions', [])
+            elif isinstance(inner, list):
+                positions = inner
+            else:
+                positions = []
+            if positions:
+                logger.info(f'TradeLocker: {len(positions)} open position(s), sample: {positions[0]}')
+            return positions
         except Exception as e:
             logger.warning(f'TradeLocker: failed to get positions: {e}')
             return []

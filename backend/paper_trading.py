@@ -216,9 +216,9 @@ async def log_predictions(buf):
 
     # Skip during weekend market closure
     # Also skip Friday evening when maturity would land in the weekend gap.
-    # FX closes ~Fri 22:00 UTC, reopens ~Sun 21:00 UTC.
-    # Backtest filter: no Saturday (dayofweek==5), no Sunday before 21:00.
-    if now.weekday() == 5 or (now.weekday() == 6 and now.hour < 21):
+    # FX closes ~Fri 22:00 UTC, reopens ~Sun 21:05 UTC.
+    # Start at Sunday 22:02 to ensure the 21:00 bar has fully formed.
+    if now.weekday() == 5 or (now.weekday() == 6 and now.hour < 22):
         logger.info('Market closed (weekend) -- skipping inference.')
         return 0
     # On Friday, skip if the exit candle would not fully close before market
@@ -580,8 +580,29 @@ async def run_loop():
             # 2. Resolve paper trading outcomes
             await resolve_outcomes()
 
-            # 3. Run inference and log predictions
-            await log_predictions(buf)
+            # 3. Run inference and log predictions (with retry if candle not ready)
+            logged = await log_predictions(buf)
+
+            # If no predictions were logged and we're within the first 90s of
+            # the hour, the latest 1H candle may not be available yet on Polygon.
+            # Retry up to 3 times with 15s delay.
+            # Don't retry during weekends or Friday late session (those return 0 intentionally).
+            now_check = datetime.now(timezone.utc)
+            is_weekend = (now_check.weekday() == 5 or
+                          (now_check.weekday() == 6 and now_check.hour < 22))
+            is_friday_late = (now_check.weekday() == 4 and now_check.hour >= 17)
+            is_market_open = not is_weekend and not is_friday_late
+            if logged == 0 and now_check.minute < 2 and is_market_open:
+                for attempt in range(1, 4):
+                    logger.info(
+                        f'No predictions logged, candle may not be ready. '
+                        f'Retry {attempt}/3 in 15s...'
+                    )
+                    await asyncio.sleep(15)
+                    buf = await _init_buffer()
+                    logged = await log_predictions(buf)
+                    if logged > 0:
+                        break
 
             # 4. Place trades for new tradeable signals
             if bot.is_enabled():
@@ -602,12 +623,14 @@ async def run_loop():
         except Exception as e:
             logger.error(f'Loop error: {e}', exc_info=True)
 
-        # Sleep until XX:02 of the next hour — run as early as possible
+        # Sleep until XX:00:30 of the next hour — run as early as possible
         # after the 1H candle closes to minimize position entry delay.
         now = datetime.now(timezone.utc)
-        next_run = (now + timedelta(hours=1)).replace(minute=2, second=0, microsecond=0)
+        next_run = (now + timedelta(hours=1)).replace(minute=0, second=30, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(hours=1)
         sleep_secs = (next_run - now).total_seconds()
-        logger.info(f'Sleeping until {next_run.strftime("%H:%M")} UTC ({sleep_secs/60:.1f} min)...')
+        logger.info(f'Sleeping until {next_run.strftime("%H:%M:%S")} UTC ({sleep_secs/60:.1f} min)...')
         await asyncio.sleep(sleep_secs)
 
 
