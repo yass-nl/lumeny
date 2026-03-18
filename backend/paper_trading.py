@@ -173,11 +173,8 @@ def _run_inference_sync(buf) -> tuple[dict, dict]:
                 logger.warning(f'Insufficient 1m data for {pair}: {len(df_1m)} bars')
                 continue
 
-            # Drop last candle from each TF -- may be incomplete (partially formed
-            # from live minute aggregates). Matches backtest and main.py behavior.
-            df_1m = df_1m.iloc[:-1] if len(df_1m) > 1 else df_1m
-            df_5m = df_5m.iloc[:-1] if len(df_5m) > 1 else df_5m
-            df_15m = df_15m.iloc[:-1] if len(df_15m) > 1 else df_15m
+            # Note: data_service.py already filters out incomplete bars,
+            # so no additional drop needed here.
 
             # Compute microstructure features
             features_df = compute_features_for_pair(pair, df_1m, df_5m, df_15m)
@@ -610,7 +607,7 @@ async def run_loop():
                 # Get the latest tradeable predictions (logged in the last 5 minutes)
                 cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
                 rows = conn.execute("""
-                    SELECT id, pair, direction, q50, meta_proba, is_tradeable, matures_at
+                    SELECT id, pair, direction, q50, meta_proba, is_tradeable, matures_at, entry_price
                     FROM predictions
                     WHERE logged_at >= ? AND is_tradeable = 1
                 """, (cutoff,)).fetchall()

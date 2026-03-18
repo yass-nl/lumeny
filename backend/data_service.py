@@ -106,52 +106,66 @@ class CandleBuffer:
     async def initialize(self):
         """
         Load enough historical data to compute microstructure features.
-        Fetches 1m, 5m, 15m from Polygon REST directly.
-        1H fetched for entry/exit price lookup (not needed for features).
+        Fetches 1m (7 days) and resamples 5m/15m locally to match training pipeline.
+        1H fetched separately for entry/exit price lookup (not used for features).
         """
         logger.info('Initializing candle buffers from Polygon REST...')
 
         now = datetime.now(timezone.utc)
         to_date = now.strftime('%Y-%m-%d')
+        now_naive = now.replace(tzinfo=None)
 
-        # Bar durations in minutes for each fetched timeframe
-        tf_durations_min = {'1m': 1, '5m': 5, '15m': 15, '1H': 60}
-
-        # Fetch config: timeframe -> (multiplier, timespan, lookback_days)
-        # 1m: 3 days gives ~60*24*3 = ~4320 bars (enough for warmup + current)
-        # 5m: 3 days gives ~12*24*3 = ~864 bars
-        # 15m: 7 days gives ~4*24*7 = ~672 bars
-        # 1H: 30 days gives ~24*30 = ~720 bars (for price lookup / resolution)
-        tf_fetch_config = {
-            '1m':  (1,   'minute', 3),
-            '5m':  (5,   'minute', 3),
-            '15m': (15,  'minute', 7),
-            '1H':  (1,   'hour',   30),
-        }
+        # 1m: 7 days to give enough data for 15m features and trailing warmup
+        # 1H: 30 days for entry/exit price lookup / resolution
+        from_date_1m = (now - timedelta(days=7)).strftime('%Y-%m-%d')
+        from_date_1h = (now - timedelta(days=30)).strftime('%Y-%m-%d')
 
         for pair in PAIRS:
             logger.info(f'  Fetching {pair}...')
             self.buffers[pair] = {}
 
-            for tf_name, (multiplier, timespan, lookback_days) in tf_fetch_config.items():
-                from_date = (now - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
-                await asyncio.sleep(0.3)  # avoid Polygon rate limit
-                try:
-                    df = await fetch_historical_bars(pair, multiplier, timespan, from_date, to_date)
-                    if not df.empty:
-                        # Filter out weekend market closure: Sat all day + Sun before 21:00 UTC
-                        df = df[~((df.index.dayofweek == 5) |
-                                  ((df.index.dayofweek == 6) & (df.index.hour < 21)))]
-                        # Drop bars that haven't fully closed yet.
-                        bar_dur = timedelta(minutes=tf_durations_min[tf_name])
-                        now_naive = now.replace(tzinfo=None)
-                        df = df[df.index + bar_dur <= now_naive]
-                        self.buffers[pair][tf_name] = df
-                        logger.info(f'    {pair} {tf_name}: {len(df)} candles ({df.index[0].date()} to {df.index[-1].date()})')
-                    else:
-                        logger.warning(f'    {pair} {tf_name}: no data')
-                except Exception as e:
-                    logger.warning(f'    {pair} {tf_name} error: {e}')
+            # Fetch 1m bars
+            await asyncio.sleep(0.3)
+            try:
+                df_1m = await fetch_historical_bars(pair, 1, 'minute', from_date_1m, to_date)
+                if not df_1m.empty:
+                    # Filter weekends
+                    df_1m = df_1m[~((df_1m.index.dayofweek == 5) |
+                                    ((df_1m.index.dayofweek == 6) & (df_1m.index.hour < 21)))]
+                    # Drop bars that haven't fully closed yet
+                    df_1m = df_1m[df_1m.index + timedelta(minutes=1) <= now_naive]
+                    self.buffers[pair]['1m'] = df_1m
+                    logger.info(f'    {pair} 1m: {len(df_1m)} candles ({df_1m.index[0].date()} to {df_1m.index[-1].date()})')
+
+                    # Resample 5m/15m from 1m — matches training and backtest pipeline
+                    df_5m = resample_ohlcv(df_1m, '5min')
+                    df_15m = resample_ohlcv(df_1m, '15min')
+                    # Drop incomplete bars
+                    df_5m = df_5m[df_5m.index + timedelta(minutes=5) <= now_naive]
+                    df_15m = df_15m[df_15m.index + timedelta(minutes=15) <= now_naive]
+                    self.buffers[pair]['5m'] = df_5m
+                    self.buffers[pair]['15m'] = df_15m
+                    logger.info(f'    {pair} 5m: {len(df_5m)} candles (resampled from 1m)')
+                    logger.info(f'    {pair} 15m: {len(df_15m)} candles (resampled from 1m)')
+                else:
+                    logger.warning(f'    {pair} 1m: no data')
+            except Exception as e:
+                logger.warning(f'    {pair} 1m error: {e}')
+
+            # Fetch 1H separately (for entry/exit prices, not features)
+            await asyncio.sleep(0.3)
+            try:
+                df_1h = await fetch_historical_bars(pair, 1, 'hour', from_date_1h, to_date)
+                if not df_1h.empty:
+                    df_1h = df_1h[~((df_1h.index.dayofweek == 5) |
+                                    ((df_1h.index.dayofweek == 6) & (df_1h.index.hour < 21)))]
+                    df_1h = df_1h[df_1h.index + timedelta(minutes=60) <= now_naive]
+                    self.buffers[pair]['1H'] = df_1h
+                    logger.info(f'    {pair} 1H: {len(df_1h)} candles ({df_1h.index[0].date()} to {df_1h.index[-1].date()})')
+                else:
+                    logger.warning(f'    {pair} 1H: no data')
+            except Exception as e:
+                logger.warning(f'    {pair} 1H error: {e}')
 
         self._initialized = True
         logger.info('Candle buffers initialized.')

@@ -8,7 +8,6 @@ Integrates with the paper trading loop:
 Uses TradeLocker REST API with JWT auth.
 """
 
-import asyncio
 import logging
 import os
 import time
@@ -41,11 +40,12 @@ PAIR_TO_SYMBOL = {
     'CADJPY': 'CAD/JPY', 'CHFJPY': 'CHF/JPY', 'AUDNZD': 'AUD/NZD',
 }
 
-# Position sizing (lots) -- conservative default
-DEFAULT_LOT_SIZE = 0.3
+# Position sizing
+MAX_LOT_SIZE = 0.3            # ideal lot size per trade
+MIN_MARGIN_TO_TRADE = 400     # skip if available margin below this
 
-# Max concurrent positions to avoid overexposure
-MAX_CONCURRENT_POSITIONS = 5
+# Spread filter
+MAX_SPREAD_POINTS = 30        # skip trade if spread exceeds this many points
 
 # How long to hold a position (hours)
 HOLD_HOURS = 4
@@ -73,6 +73,7 @@ class TradeLockerBot:
         self.acc_num = None
         self.account_id = TRADELOCKER_ACCOUNT_ID
         self.instrument_map = {}  # pair -> tradableInstrumentId
+        self.info_route_map = {}  # pair -> INFO routeId (for quotes)
         self.route_id = None  # TRADE routeId
         self.info_route_id = None  # INFO routeId
         # Track open positions: {prediction_id: {positionId, pair, close_at}}
@@ -229,6 +230,8 @@ class TradeLockerBot:
             info = symbol_lookup.get(symbol) or symbol_lookup.get(pair)
             if info:
                 self.instrument_map[pair] = info['id']
+                if info.get('infoRouteId'):
+                    self.info_route_map[pair] = info['infoRouteId']
                 if self.route_id is None and info.get('routeId'):
                     self.route_id = info['routeId']
             else:
@@ -305,7 +308,7 @@ class TradeLockerBot:
 
     async def place_trades(self, predictions_db):
         """
-        Place market orders for tradeable signals from the latest inference.
+        Place market orders for tradeable signals.
 
         predictions_db: list of dicts from the DB (the newly logged predictions)
         Each has: id, pair, direction, is_tradeable, meta_proba, q50, matures_at
@@ -323,15 +326,11 @@ class TradeLockerBot:
         # Sort by meta_proba descending -- prioritize highest confidence
         tradeable.sort(key=lambda p: p['meta_proba'], reverse=True)
 
-        for pred in tradeable:
-            # Check max concurrent positions
-            if len(self.open_positions) >= MAX_CONCURRENT_POSITIONS:
-                logger.info(
-                    f'TradeLocker: max concurrent positions ({MAX_CONCURRENT_POSITIONS}) reached, '
-                    f'skipping remaining signals'
-                )
-                break
+        # Get available margin before placing trades
+        available_margin = await self._get_available_margin()
+        logger.info(f'TradeLocker: available margin=${available_margin:.2f}')
 
+        for pred in tradeable:
             pair = pred['pair']
             direction = pred['direction']
             pred_id = pred['id']
@@ -345,33 +344,59 @@ class TradeLockerBot:
                 logger.warning(f'TradeLocker: no instrument mapped for {pair}, skipping')
                 continue
 
+            # Spread check: skip if spread > 30 points
+            spread_points = await self._get_spread_points(pair)
+            if spread_points is not None and spread_points > MAX_SPREAD_POINTS:
+                logger.info(f'TradeLocker: SKIP {pair} — spread={spread_points:.1f} points > 30')
+                continue
+
+            # Check margin and compute lot size
+            if available_margin < MIN_MARGIN_TO_TRADE:
+                logger.info(
+                    f'TradeLocker: available margin ${available_margin:.2f} < ${MIN_MARGIN_TO_TRADE}, '
+                    f'skipping remaining signals'
+                )
+                break
+
+            # Use MAX_LOT_SIZE (0.3) if enough margin, otherwise scale down
+            # Estimate margin needed: 0.3 lots worst case ~$1,150 (EUR cross at 30:1)
+            # Scale: lot_size = min(MAX_LOT_SIZE, available_margin / estimated_margin_per_lot)
+            # Use conservative estimate: $3,800 per lot for crosses, $2,000 per lot for majors
+            est_margin_per_lot = 3800  # conservative: ~$1,140 for 0.3 lots cross
+            max_affordable = available_margin / est_margin_per_lot
+            lot_size = min(MAX_LOT_SIZE, round(max_affordable, 2))
+            lot_size = max(round(lot_size, 2), 0.01)  # minimum 0.01 lots
+
             side = 'buy' if direction == 'bullish' else 'sell'
 
             try:
+                logger.info(f'TradeLocker: placing MARKET {side.upper()} {lot_size} lots {pair}')
                 order_id = await self._place_market_order(
                     instrument_id=instrument_id,
                     side=side,
-                    qty=DEFAULT_LOT_SIZE,
+                    qty=lot_size,
                 )
 
                 if order_id:
-                    # Calculate when to close
                     matures_at = datetime.fromisoformat(pred['matures_at'])
-                    close_at = matures_at  # matures_at already accounts for the 4H hold
 
                     self.open_positions[pred_id] = {
                         'order_id': order_id,
                         'position_id': None,  # filled async
                         'pair': pair,
                         'side': side,
-                        'close_at': close_at,
+                        'close_at': matures_at,
                         'instrument_id': instrument_id,
                     }
 
+                    # Deduct estimated margin so next iteration knows what's left
+                    available_margin -= lot_size * est_margin_per_lot
+
                     logger.info(
-                        f'TradeLocker: {side.upper()} {DEFAULT_LOT_SIZE} lots {pair} '
+                        f'TradeLocker: {side.upper()} {lot_size} lots {pair} '
                         f'(meta={pred["meta_proba"]:.2f}, q50={pred["q50"]:.6f}) '
-                        f'order_id={order_id}, close_at={close_at.isoformat()}'
+                        f'order_id={order_id}, close_at={matures_at.isoformat()}, '
+                        f'remaining_margin~${available_margin:.0f}'
                     )
 
             except Exception as e:
@@ -397,7 +422,6 @@ class TradeLockerBot:
             resp.raise_for_status()
             data = resp.json()
 
-        # Response may be nested: {'s': 'ok', 'd': {'orderId': ...}}
         if isinstance(data, dict) and 'd' in data:
             inner = data['d']
         else:
@@ -405,8 +429,8 @@ class TradeLockerBot:
         if isinstance(inner, dict):
             order_id = inner.get('orderId') or inner.get('id')
         else:
-            order_id = inner  # might be just the ID directly
-        logger.info(f'TradeLocker: order response: {data}')
+            order_id = inner
+        logger.info(f'TradeLocker: market order response: {data}')
         return order_id
 
     async def close_matured_positions(self):
@@ -567,6 +591,78 @@ class TradeLockerBot:
                 return resp.json()
         except Exception as e:
             logger.warning(f'TradeLocker: failed to get account state: {e}')
+            return None
+
+    async def _get_available_margin(self) -> float:
+        """Return available margin from account state.
+        TradeLocker returns accountDetailsData as an array — index 4 is free/available margin."""
+        state = await self.get_account_state()
+        if not state:
+            return 0.0
+        data = state.get('d', state) if isinstance(state, dict) else state
+
+        # accountDetailsData is a list; index 4 = available margin (free margin)
+        details = data.get('accountDetailsData') if isinstance(data, dict) else None
+        if isinstance(details, list) and len(details) > 4:
+            val = details[4]
+            if val is not None:
+                logger.info(f'TradeLocker: available margin=${float(val):.2f} (accountDetailsData[4])')
+                return float(val)
+
+        # Fallback: named keys
+        for key in ['availableMargin', 'freeMargin', 'available_margin', 'free_margin']:
+            if key in data:
+                return float(data[key])
+        equity = 0.0
+        used = 0.0
+        for k in ['equity', 'Equity']:
+            if k in data:
+                equity = float(data[k])
+                break
+        for k in ['usedMargin', 'used_margin', 'margin', 'Margin']:
+            if k in data:
+                used = float(data[k])
+                break
+        if equity > 0:
+            return equity - used
+        logger.warning(f'TradeLocker: could not parse available margin from state: {data}')
+        return 0.0
+
+    async def _get_spread_points(self, pair: str) -> float | None:
+        """Fetch current bid/ask from TradeLocker and return spread in points.
+        JPY pairs: 1 point = 0.001. All others: 1 point = 0.00001.
+        Returns None if quote unavailable."""
+        instrument_id = self.instrument_map.get(pair)
+        info_route_id = self.info_route_map.get(pair)
+        if not instrument_id or not info_route_id:
+            return None
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f'{BASE_URL}/trade/quotes',
+                    headers=self._headers(),
+                    params={
+                        'tradableInstrumentId': instrument_id,
+                        'routeId': info_route_id,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            quotes = data.get('d', data) if isinstance(data, dict) else data
+            if isinstance(quotes, dict):
+                ask = float(quotes.get('ap', 0))
+                bid = float(quotes.get('bp', 0))
+                if ask > 0 and bid > 0:
+                    point_size = 0.001 if 'JPY' in pair else 0.00001
+                    spread_points = (ask - bid) / point_size
+                    logger.info(f'TradeLocker: {pair} bid={bid} ask={ask} spread={spread_points:.1f} points')
+                    return spread_points
+            logger.warning(f'TradeLocker: unexpected quote format for {pair}: {data}')
+            return None
+        except Exception as e:
+            logger.warning(f'TradeLocker: failed to get quote for {pair}: {e}')
             return None
 
     async def get_open_positions_list(self):

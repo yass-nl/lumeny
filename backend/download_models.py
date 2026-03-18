@@ -20,12 +20,9 @@ FILES = [
 
 
 def download():
-    # Check if ALL models already exist on volume
-    missing = [f for f in FILES if not (MODELS_DIR / f).exists()]
-    if not missing:
-        print(f"All {len(FILES)} models already present in {MODELS_DIR}, skipping download.")
-        return
-    print(f"Missing {len(missing)} model(s): {missing}")
+    # Always re-download to ensure latest models from R2
+    missing = FILES
+    print(f"Downloading {len(missing)} model(s) from R2...")
 
     account_id = os.environ["R2_ACCOUNT_ID"]
     access_key = os.environ["R2_ACCESS_KEY_ID"]

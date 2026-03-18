@@ -42,6 +42,7 @@ PAIRS = [
 
 MODELS_DIR = Path('backend/models_5.1/3_quants')
 META_DIR   = Path('backend/models_5.1/meta')
+RESCUE_DIR = Path('backend/models_5.1/rescue')
 
 AVG_SPREAD = 0.00028
 MIN_Q50_THRESHOLD = AVG_SPREAD * 0.5
@@ -53,6 +54,9 @@ TOTAL_FETCH_DAYS = BACKTEST_DAYS + WARMUP_DAYS
 
 # Meta-model thresholds to evaluate
 META_THRESHOLDS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+
+# Rescue-model thresholds to evaluate
+RESCUE_THRESHOLDS = [0.50, 0.55, 0.60, 0.65]
 
 print(f'Live Backtest v5.2 — 15-pair model (4H target)')
 print(f'  API key: {"OK" if API_KEY else "MISSING"}')
@@ -700,19 +704,22 @@ def compute_features_for_pair(pair, data):
 # MODEL INFERENCE
 # ──────────────────────────────────────────────
 def run_inference(df_all):
-    """Run Q25/Q50/Q75 + meta-model on feature data."""
+    """Run Q25/Q50/Q75 + meta-model + rescue-model on feature data."""
 
     # Load models — all quantile models are in 3_quants/ for v5.1
     q50_bundle = joblib.load(MODELS_DIR / 'model_1H_Q50.joblib')
     q25_bundle = joblib.load(MODELS_DIR / 'model_1H_Q25.joblib')
     q75_bundle = joblib.load(MODELS_DIR / 'model_1H_Q75.joblib')
     meta_bundle = joblib.load(META_DIR / 'meta_confidence.joblib')
+    rescue_bundle = joblib.load(RESCUE_DIR / 'rescue_model.joblib')
 
     feature_cols = q50_bundle['feature_cols']
     meta_feature_cols = meta_bundle['meta_feature_cols']
+    rescue_feature_cols = rescue_bundle['rescue_feature_cols']
+    pair_map = rescue_bundle['pair_map']
 
-    # Prepare features
-    X = df_all[feature_cols].ffill().fillna(0)
+    # Prepare features (per-pair ffill to match live inference)
+    X = df_all[feature_cols].groupby(df_all['pair']).ffill().fillna(0)
 
     # Q50/Q25/Q75 predictions
     q50_pred = q50_bundle['model'].predict(X)
@@ -738,12 +745,58 @@ def run_inference(df_all):
     tradeable_mask = df_all['abs_Q50'] > MIN_Q50_THRESHOLD
     df_tradeable = df_all[tradeable_mask].copy()
 
+    df_all['meta_proba'] = np.nan
     if len(df_tradeable) > 0:
-        X_meta = df_tradeable[meta_feature_cols].ffill().fillna(0)
+        X_meta = df_tradeable[meta_feature_cols].groupby(df_tradeable['pair']).ffill().fillna(0)
         meta_proba = meta_bundle['model'].predict_proba(X_meta)[:, 1]
         df_all.loc[tradeable_mask, 'meta_proba'] = meta_proba
-    else:
-        df_all['meta_proba'] = np.nan
+
+    # ── Rescue model: score rejected signals ──
+    # Rejected = not tradeable (|Q50| < 0.5x spread) OR tradeable but meta < 0.55
+    meta_accepted_mask = tradeable_mask & (df_all['meta_proba'] > 0.55)
+    rejected_mask = ~meta_accepted_mask
+
+    # Build contextual features for rescue model
+    df_all['pair_id'] = df_all['pair'].map(pair_map).fillna(0).astype(int)
+    df_all['hour_sin'] = np.sin(2 * np.pi * df_all.index.hour / 24)
+    df_all['hour_cos'] = np.cos(2 * np.pi * df_all.index.hour / 24)
+    df_all['dow_sin'] = np.sin(2 * np.pi * df_all.index.dayofweek / 5)
+    df_all['dow_cos'] = np.cos(2 * np.pi * df_all.index.dayofweek / 5)
+
+    # Cross-pair agreement: for each timestamp, how many pairs agree on direction
+    ts_groups = df_all.groupby(df_all.index)
+    n_positive = ts_groups['pred_dir'].transform(lambda x: (x > 0).sum())
+    n_negative = ts_groups['pred_dir'].transform(lambda x: (x < 0).sum())
+    n_pairs = ts_groups['pred_dir'].transform('count')
+    df_all['n_positive'] = n_positive
+    df_all['n_negative'] = n_negative
+    df_all['n_pairs'] = n_pairs
+    df_all['cross_pair_agree'] = np.where(
+        df_all['pred_dir'] > 0,
+        df_all['n_positive'] / df_all['n_pairs'],
+        df_all['n_negative'] / df_all['n_pairs']
+    )
+
+    # is_tradeable_zone: whether |Q50| > spread threshold
+    df_all['is_tradeable_zone'] = tradeable_mask.astype(int)
+
+    # Fill meta_proba for rescue (non-tradeable rows get NaN, fill with 0.5)
+    df_all['meta_proba_rescue'] = df_all['meta_proba'].fillna(0.5)
+
+    # Score rejected signals with rescue model
+    df_all['rescue_proba'] = np.nan
+    df_rejected = df_all[rejected_mask].copy()
+
+    if len(df_rejected) > 0:
+        # The rescue model expects 'meta_proba' in its feature cols — use the filled version
+        df_rejected['meta_proba'] = df_rejected['meta_proba_rescue']
+        X_rescue = df_rejected[rescue_feature_cols].groupby(df_rejected['pair']).ffill().fillna(0)
+        rescue_proba = rescue_bundle['model'].predict_proba(X_rescue)[:, 1]
+        df_all.loc[rejected_mask, 'rescue_proba'] = rescue_proba
+
+    print(f'  Meta-accepted (P>0.55 & |Q50|>0.5x): {meta_accepted_mask.sum():,}')
+    print(f'  Rejected (rescue candidates): {rejected_mask.sum():,}')
+    print(f'  Rescue scored: {df_all["rescue_proba"].notna().sum():,}')
 
     return df_all
 
@@ -820,6 +873,70 @@ def simulate_trades(df_all, backtest_start):
         sharpe = (pnl.mean() / pnl.std()) * np.sqrt(252 * 24) if pnl.std() > 0 else 0
         flag = ' <<<' if wr >= 0.80 and n >= 10 else (' <<' if wr >= 0.70 else '')
         print(f'P > {thresh:.2f}    {n:>8,} {n/max(n_days,1):>8.2f} {wr:>7.1%} {pnl.mean():>12.6f} {pnl.sum():>10.4f} {sharpe:>8.2f}{flag}')
+
+    # ── Rescue-only results ──
+    df_rescued = df[df['rescue_proba'].notna()].copy()
+    print(f'\n--- Rescue Model Results ---')
+    print(f'Rejected hours with rescue score: {len(df_rescued):,}')
+
+    print(f'\n{"Threshold":<12} {"Rescued":>8} {"R/day":>8} {"WR":>8} {"EV/trade":>12} {"TotalPnL":>10} {"Sharpe":>8}')
+    print('-' * 75)
+    for thresh in RESCUE_THRESHOLDS:
+        s = apply_4h_cooldown(df_rescued[df_rescued['rescue_proba'] > thresh])
+        n = len(s)
+        if n < 3:
+            continue
+        pnl = s['pred_dir'] * s['label_1H'] - AVG_SPREAD
+        wr = (s['pred_dir'] == s['actual_dir']).mean()
+        sharpe = (pnl.mean() / pnl.std()) * np.sqrt(252 * 24) if pnl.std() > 0 else 0
+        flag = ' <<<' if wr >= 0.65 and pnl.sum() > 0 else ''
+        print(f'R > {thresh:.2f}    {n:>8,} {n/max(n_days,1):>8.2f} {wr:>7.1%} {pnl.mean():>12.6f} {pnl.sum():>10.4f} {sharpe:>8.2f}{flag}')
+
+    # ── Combined pipeline: Meta P>0.55 + Rescue ──
+    META_BEST = 0.55
+    meta_trades = apply_4h_cooldown(df_tradeable[df_tradeable['meta_proba'] > META_BEST])
+    meta_pnl_series = meta_trades['pred_dir'] * meta_trades['label_1H'] - AVG_SPREAD
+
+    print(f'\n--- Combined Pipeline: Meta P>{META_BEST} + Rescue ---')
+    print(f'{"Rescue Thresh":<15} {"Meta Tr":>8} {"Rescued":>8} {"Total":>8} {"Tr/day":>8} {"WR":>8} {"EV/trade":>12} {"TotalPnL":>10} {"vs Meta":>10}')
+    print('-' * 100)
+
+    for rthresh in RESCUE_THRESHOLDS:
+        rescued_trades = apply_4h_cooldown(df_rescued[df_rescued['rescue_proba'] > rthresh])
+        n_rescued = len(rescued_trades)
+        if n_rescued < 3:
+            continue
+        rescued_pnl = rescued_trades['pred_dir'] * rescued_trades['label_1H'] - AVG_SPREAD
+
+        # Combined
+        combined_pnl = pd.concat([meta_pnl_series, rescued_pnl])
+        total_n = len(meta_trades) + n_rescued
+        total_pnl = combined_pnl.sum()
+        wr_combined = (pd.concat([
+            (meta_trades['pred_dir'] == meta_trades['actual_dir']),
+            (rescued_trades['pred_dir'] == rescued_trades['actual_dir'])
+        ])).mean()
+
+        delta = rescued_pnl.sum()
+        flag = ' <<<' if delta > 0 else ''
+        print(f'R > {rthresh:.2f}       {len(meta_trades):>8,} {n_rescued:>8,} {total_n:>8,} '
+              f'{total_n/max(n_days,1):>8.2f} {wr_combined:>7.1%} {combined_pnl.mean():>12.6f} '
+              f'{total_pnl:>10.4f} {delta:>+10.4f}{flag}')
+
+    # ── Per-pair breakdown for best rescue threshold ──
+    RESCUE_BEST = 0.55
+    rescued_best = apply_4h_cooldown(df_rescued[df_rescued['rescue_proba'] > RESCUE_BEST])
+    if len(rescued_best) > 0:
+        print(f'\n--- Rescued Signals at R>{RESCUE_BEST} — Per-Pair (with 4H cooldown) ---')
+        print(f'{"Pair":<10} {"Rescued":>8} {"R/day":>8} {"WR":>8} {"EV/trade":>12} {"TotalPnL":>10}')
+        print('-' * 60)
+        for pair in sorted(rescued_best['pair'].unique()):
+            p = rescued_best[rescued_best['pair'] == pair]
+            pnl = p['pred_dir'] * p['label_1H'] - AVG_SPREAD
+            wr = (p['pred_dir'] == p['actual_dir']).mean()
+            flag = ' <<<' if pnl.sum() > 0 else ''
+            print(f'{pair:<10} {len(p):>8,} {len(p)/max(n_days,1):>8.2f} {wr:>7.1%} '
+                  f'{pnl.mean():>12.6f} {pnl.sum():>10.4f}{flag}')
 
     # ── Strategy: take all trades where meta P > 0.50 ──
     META_THRESH = 0.50
@@ -988,6 +1105,79 @@ def walk_forward_validation(df_all, backtest_start):
             flag = ' <<<' if wr >= 0.70 else (' <<' if wr >= 0.60 else '')
             block_label = f'{bs.date()} - {(be - pd.Timedelta(days=1)).date()}'
             print(f'{block_label:<25} {n_days_block:>5} {n:>7} {n/max(n_days_block,1):>7.2f} {wr:>6.1%} {pnl.mean():>11.6f} {pnl.sum():>9.4f} {sharpe:>7.2f}{flag}')
+
+    # ── Rescue model walk-forward ──
+    print(f'\n{"="*80}')
+    print(f'RESCUE MODEL WALK-FORWARD')
+    print(f'{"="*80}')
+    for rthresh in RESCUE_THRESHOLDS:
+        print(f'\n--- Rescue R > {rthresh:.2f} ---')
+        print(f'{"Block":<25} {"Days":>5} {"Rescued":>8} {"R/day":>7} {"WR":>7} {"EV/trade":>11} {"PnL":>9} {"Sharpe":>7}')
+        print('-' * 85)
+        block_results_r = []
+        for i, (bs, be, bdf) in enumerate(blocks):
+            bdf_rescued = bdf[bdf['rescue_proba'].notna()]
+            s = apply_4h_cooldown(bdf_rescued[bdf_rescued['rescue_proba'] > rthresh])
+            n = len(s)
+            n_days_block = (be - bs).days
+            if n < 2:
+                print(f'{str(bs.date())} - {str((be - pd.Timedelta(days=1)).date()):<11} {n_days_block:>5} {n:>8}')
+                block_results_r.append({'trades': n, 'wr': np.nan, 'pnl': 0})
+                continue
+            pnl = s['pred_dir'] * s['label_1H'] - AVG_SPREAD
+            wr = (s['pred_dir'] == s['actual_dir']).mean()
+            sharpe = (pnl.mean() / pnl.std()) * np.sqrt(252 * 24) if pnl.std() > 0 else 0
+            flag = ' <<<' if wr >= 0.60 and pnl.sum() > 0 else ''
+            block_label = f'{bs.date()} - {(be - pd.Timedelta(days=1)).date()}'
+            print(f'{block_label:<25} {n_days_block:>5} {n:>8} {n/max(n_days_block,1):>7.2f} {wr:>6.1%} {pnl.mean():>11.6f} {pnl.sum():>9.4f} {sharpe:>7.2f}{flag}')
+            block_results_r.append({'trades': n, 'wr': wr, 'pnl': pnl.sum()})
+        valid_r = [r for r in block_results_r if not np.isnan(r.get('wr', np.nan))]
+        if len(valid_r) >= 2:
+            n_pos = sum(1 for r in valid_r if r['pnl'] > 0)
+            total_pnl_r = sum(r['pnl'] for r in valid_r)
+            print(f'  AGGREGATE: {sum(r["trades"] for r in valid_r)} trades, PnL={total_pnl_r:.4f}, '
+                  f'Blocks positive: {n_pos}/{len(valid_r)}')
+
+    # ── Combined walk-forward: Meta P>0.55 + Rescue ──
+    print(f'\n{"="*80}')
+    print(f'COMBINED WALK-FORWARD: Meta P>0.55 + Rescue')
+    print(f'{"="*80}')
+    META_BEST_WF = 0.55
+    for rthresh in RESCUE_THRESHOLDS:
+        print(f'\n--- Meta P>{META_BEST_WF} + Rescue R>{rthresh:.2f} ---')
+        print(f'{"Block":<25} {"Days":>5} {"Meta":>6} {"Resc":>6} {"Total":>6} {"WR":>7} {"MetaPnL":>9} {"RescPnL":>9} {"CombPnL":>9}')
+        print('-' * 95)
+        for i, (bs, be, bdf) in enumerate(blocks):
+            n_days_block = (be - bs).days
+            # Meta trades
+            bdf_tradeable = bdf[bdf['meta_proba'].notna()]
+            meta_s = apply_4h_cooldown(bdf_tradeable[bdf_tradeable['meta_proba'] > META_BEST_WF])
+            # Rescued trades
+            bdf_rescued = bdf[bdf['rescue_proba'].notna()]
+            rescue_s = apply_4h_cooldown(bdf_rescued[bdf_rescued['rescue_proba'] > rthresh])
+
+            n_meta = len(meta_s)
+            n_resc = len(rescue_s)
+            total_n = n_meta + n_resc
+
+            if total_n < 2:
+                print(f'{str(bs.date())} - {str((be - pd.Timedelta(days=1)).date()):<11} {n_days_block:>5} {n_meta:>6} {n_resc:>6} {total_n:>6}')
+                continue
+
+            meta_pnl = (meta_s['pred_dir'] * meta_s['label_1H'] - AVG_SPREAD).sum() if n_meta > 0 else 0
+            resc_pnl = (rescue_s['pred_dir'] * rescue_s['label_1H'] - AVG_SPREAD).sum() if n_resc > 0 else 0
+            comb_pnl = meta_pnl + resc_pnl
+
+            all_correct = pd.concat([
+                (meta_s['pred_dir'] == meta_s['actual_dir']) if n_meta > 0 else pd.Series(dtype=bool),
+                (rescue_s['pred_dir'] == rescue_s['actual_dir']) if n_resc > 0 else pd.Series(dtype=bool),
+            ])
+            wr = all_correct.mean() if len(all_correct) > 0 else 0
+
+            flag = ' <<<' if comb_pnl > meta_pnl and resc_pnl > 0 else ''
+            block_label = f'{bs.date()} - {(be - pd.Timedelta(days=1)).date()}'
+            print(f'{block_label:<25} {n_days_block:>5} {n_meta:>6} {n_resc:>6} {total_n:>6} {wr:>6.1%} '
+                  f'{meta_pnl:>9.4f} {resc_pnl:>9.4f} {comb_pnl:>9.4f}{flag}')
 
     # ── Monotonicity test: does higher threshold = higher WR in EACH block? ──
     print(f'\n{"="*80}')
