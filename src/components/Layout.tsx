@@ -11,7 +11,7 @@ const navStyle: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
   justifyContent: "space-between",
-  padding: "0 48px",
+  padding: "0 80px",
   height: 72,
   background: "rgba(6, 10, 16, 0.85)",
   backdropFilter: "blur(20px)",
@@ -61,7 +61,7 @@ const ctaButtonStyle: React.CSSProperties = {
 
 const footerStyle: React.CSSProperties = {
   borderTop: "1px solid rgba(255,255,255,0.05)",
-  padding: "48px 48px 32px",
+  padding: "48px 80px 32px",
   background: "#050810",
 };
 
@@ -69,7 +69,7 @@ const footerGridStyle: React.CSSProperties = {
   display: "grid",
   gridTemplateColumns: "2fr 1fr 1fr 1fr",
   gap: 48,
-  maxWidth: 1200,
+  maxWidth: 1440,
   margin: "0 auto",
   marginBottom: 48,
 };
@@ -100,7 +100,7 @@ const footerBottomStyle: React.CSSProperties = {
   alignItems: "center",
   paddingTop: 24,
   borderTop: "1px solid rgba(255,255,255,0.04)",
-  maxWidth: 1200,
+  maxWidth: 1440,
   margin: "0 auto",
 };
 

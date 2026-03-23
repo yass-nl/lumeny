@@ -31,7 +31,7 @@ function Section({
       id={id}
       initial="hidden"
       animate={inView ? "visible" : "hidden"}
-      style={{ padding: "120px 48px", maxWidth: 1200, margin: "0 auto", ...style }}
+      style={{ padding: "120px 80px", maxWidth: 1440, margin: "0 auto", ...style }}
     >
       {children}
     </motion.section>
@@ -691,7 +691,7 @@ export default function Home() {
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
               {[
                 { k: "Period", v: "Sep 2025 – Mar 2026" },
-                { k: "Pairs", v: "12 FX pairs" },
+                { k: "Pairs", v: "15 FX pairs" },
                 { k: "Avg. trades / day", v: "3.2" },
                 { k: "Total trades", v: "642" },
                 { k: "Leverage", v: "50:1" },
