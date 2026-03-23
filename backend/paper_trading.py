@@ -396,9 +396,18 @@ async def resolve_outcomes():
         try:
             matures_at = datetime.fromisoformat(row['matures_at'])
 
+            # If matured > 48h ago and still unresolved, mark as expired silently
+            if (now - matures_at.replace(tzinfo=timezone.utc if matures_at.tzinfo is None else matures_at.tzinfo)).total_seconds() > 48 * 3600:
+                conn.execute("""
+                    UPDATE predictions
+                    SET resolved_at = ?, actual_return = NULL, correct = NULL
+                    WHERE id = ?
+                """, (now.isoformat(), row['id']))
+                resolved += 1
+                continue
+
             exit_price = await _fetch_close_price(pair, matures_at)
             if exit_price is None:
-                logger.warning(f'No candle yet for {pair} matured at {matures_at}')
                 continue
 
             entry_price = row['entry_price']
