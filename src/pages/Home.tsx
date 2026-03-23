@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { motion, useInView } from "framer-motion";
 import Layout from "../components/Layout";
+import ContactModal from "../components/ContactModal";
 
 /* ─── animation helpers ─── */
 const fadeUp = {
@@ -206,7 +207,7 @@ function StatCard({
       variants={fadeUp}
       custom={i}
       style={{
-        padding: "36px 32px",
+        padding: "32px 24px",
         background: "rgba(255,255,255,0.015)",
         border: "1px solid rgba(79, 195, 247, 0.06)",
         borderRadius: 8,
@@ -231,7 +232,7 @@ function StatCard({
       </div>
       <div
         style={{
-          fontSize: 36,
+          fontSize: 30,
           fontFamily: "'Syne', sans-serif",
           fontWeight: 700,
           color: "#e8eaf0",
@@ -259,8 +260,21 @@ function StatCard({
 
 /* ─── main page ─── */
 export default function Home() {
+  const [modalOpen, setModalOpen] = useState(false);
+  const [modalSubject, setModalSubject] = useState("Schedule a Call");
+
+  const openModal = (subject: string) => {
+    setModalSubject(subject);
+    setModalOpen(true);
+  };
+
   return (
-    <Layout>
+    <Layout onContact={() => openModal("Inquiry")}>
+      <ContactModal
+        isOpen={modalOpen}
+        onClose={() => setModalOpen(false)}
+        subject={modalSubject}
+      />
       {/* ══════ HERO ══════ */}
       <div
         style={{
@@ -353,7 +367,8 @@ export default function Home() {
             style={{ display: "flex", gap: 16, justifyContent: "center" }}
           >
             <a
-              href="mailto:info@lumen-y.com?subject=Schedule a Call"
+              onClick={(e) => { e.preventDefault(); openModal("Schedule a Call"); }}
+              href="#"
               style={{
                 padding: "14px 32px",
                 background: "rgba(79, 195, 247, 0.1)",
@@ -382,7 +397,8 @@ export default function Home() {
               Schedule a Call
             </a>
             <a
-              href="mailto:info@lumen-y.com?subject=Inquiry"
+              onClick={(e) => { e.preventDefault(); openModal("Inquiry"); }}
+              href="#"
               style={{
                 padding: "14px 32px",
                 background: "transparent",
@@ -479,10 +495,10 @@ export default function Home() {
               marginBottom: 64,
             }}
           >
-            Our models ingest multi-timeframe market microstructure data to
-            generate directional probability signals across major and cross
-            currency pairs. The methodology is purely quantitative — no
-            discretionary overlay, no narrative bias.
+            Our model processes high-dimensional market data through a
+            purely mathematical framework to generate directional probability
+            signals across major and cross currency pairs. No discretionary
+            overlay, no narrative bias — only rigorous quantitative analysis.
           </p>
         </motion.div>
 
@@ -495,8 +511,8 @@ export default function Home() {
         >
           {[
             {
-              title: "Multi-Horizon",
-              desc: "Signals generated across multiple time horizons, from intraday to weekly, enabling flexible integration into existing strategies.",
+              title: "High-Dimensional",
+              desc: "Each signal is derived from a dense feature space engineered to capture market dynamics invisible to conventional analysis.",
               icon: "◎",
             },
             {
@@ -505,8 +521,8 @@ export default function Home() {
               icon: "⬡",
             },
             {
-              title: "Microstructure-Driven",
-              desc: "Engineered features derived from order flow dynamics, volatility regimes, and cross-pair confluence patterns.",
+              title: "Mathematical Rigor",
+              desc: "Built on a statistical learning framework — every signal is a probability, every decision is model-driven. No heuristics, no intuition.",
               icon: "◇",
             },
           ].map((item, i) => (
@@ -622,15 +638,25 @@ export default function Home() {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(4, 1fr)",
-            gap: 20,
+            gridTemplateColumns: "repeat(3, 1fr)",
+            gap: 16,
+            marginBottom: 16,
+          }}
+        >
+          <StatCard label="Return" value={30.64} suffix="%" decimals={2} prefix="+" note="Over test period" i={1} />
+          <StatCard label="Win Rate" value={68.5} suffix="%" decimals={1} note="440 / 642 trades" i={2} />
+          <StatCard label="Sharpe Ratio" value={8.46} decimals={2} note="Annualized" i={3} />
+        </div>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(2, 1fr)",
+            gap: 16,
             marginBottom: 32,
           }}
         >
-          <StatCard label="Sharpe Ratio" value={8.46} decimals={2} note="Annualized" i={1} />
-          <StatCard label="Win Rate" value={68.5} suffix="%" decimals={1} note="440 / 642 trades" i={2} />
-          <StatCard label="Profit Factor" value={2.28} decimals={2} note="Gross profit / gross loss" i={3} />
-          <StatCard label="Max Drawdown" value={1.91} suffix="%" decimals={2} note="Peak-to-trough" i={4} />
+          <StatCard label="Profit Factor" value={2.28} decimals={2} note="Gross profit / gross loss" i={4} />
+          <StatCard label="Max Drawdown" value={1.91} suffix="%" decimals={2} note="Peak-to-trough" i={5} />
         </div>
 
         <div
@@ -660,7 +686,7 @@ export default function Home() {
                 marginBottom: 20,
               }}
             >
-              Test Parameters
+              Test Information
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
               {[
@@ -668,6 +694,7 @@ export default function Home() {
                 { k: "Pairs", v: "12 FX pairs" },
                 { k: "Avg. trades / day", v: "3.2" },
                 { k: "Total trades", v: "642" },
+                { k: "Leverage", v: "50:1" },
               ].map(({ k, v }) => (
                 <div key={k}>
                   <div
@@ -844,7 +871,8 @@ export default function Home() {
             style={{ display: "flex", gap: 16, justifyContent: "center" }}
           >
             <a
-              href="mailto:info@lumen-y.com?subject=Schedule a Call"
+              onClick={(e) => { e.preventDefault(); openModal("Schedule a Call"); }}
+              href="#"
               style={{
                 padding: "14px 36px",
                 background: "rgba(79, 195, 247, 0.1)",
@@ -873,7 +901,8 @@ export default function Home() {
               Schedule a Call
             </a>
             <a
-              href="mailto:info@lumen-y.com?subject=Inquiry"
+              onClick={(e) => { e.preventDefault(); openModal("Inquiry"); }}
+              href="#"
               style={{
                 padding: "14px 36px",
                 background: "transparent",

@@ -112,7 +112,7 @@ function ScrollToTop() {
   return null;
 }
 
-export default function Layout({ children }: { children: React.ReactNode }) {
+export default function Layout({ children, onContact }: { children: React.ReactNode; onContact?: () => void }) {
   const scrollTo = (id: string) => {
     const el = document.getElementById(id);
     if (el) el.scrollIntoView({ behavior: "smooth" });
@@ -156,7 +156,8 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             Performance
           </a>
           <a
-            href="mailto:info@lumen-y.com"
+            href="#"
+            onClick={(e) => { e.preventDefault(); onContact?.(); }}
             style={ctaButtonStyle}
             onMouseEnter={(e) => {
               e.currentTarget.style.background = "rgba(79, 195, 247, 0.08)";
@@ -262,6 +263,17 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             >
               info@lumen-y.com
             </a>
+            <span
+              style={{
+                display: "block",
+                color: "#374151",
+                fontSize: 11,
+                fontFamily: "'DM Mono', monospace",
+                marginTop: 4,
+              }}
+            >
+              Brussels, Belgium
+            </span>
           </div>
         </div>
 
