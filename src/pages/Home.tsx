@@ -31,6 +31,7 @@ function Section({
       id={id}
       initial="hidden"
       animate={inView ? "visible" : "hidden"}
+      className="section-container"
       style={{ padding: "120px 80px", maxWidth: 1440, margin: "0 auto", ...style }}
     >
       {children}
@@ -307,9 +308,10 @@ export default function Home() {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ duration: 1.2 }}
+          className="hero-container"
           style={{
             position: "relative",
-            textAlign: "center",
+            textAlign: "center" as const,
             maxWidth: 780,
             padding: "0 24px",
           }}
@@ -327,6 +329,7 @@ export default function Home() {
             initial={{ opacity: 0, y: 30 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.9, delay: 0.5 }}
+            className="hero-title"
             style={{
               fontFamily: "'Syne', sans-serif",
               fontSize: 64,
@@ -346,6 +349,7 @@ export default function Home() {
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.8, delay: 0.7 }}
+            className="hero-subtitle"
             style={{
               fontFamily: "'DM Mono', monospace",
               fontSize: 14,
@@ -364,6 +368,7 @@ export default function Home() {
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.8, delay: 0.9 }}
+            className="hero-ctas"
             style={{ display: "flex", gap: 16, justifyContent: "center" }}
           >
             <a
@@ -480,6 +485,7 @@ export default function Home() {
               marginBottom: 20,
               maxWidth: 500,
             }}
+            className="section-heading"
           >
             Systematic intelligence,
             <br />
@@ -503,6 +509,7 @@ export default function Home() {
         </motion.div>
 
         <div
+          className="approach-grid"
           style={{
             display: "grid",
             gridTemplateColumns: "repeat(3, 1fr)",
@@ -603,6 +610,7 @@ export default function Home() {
               marginBottom: 12,
               maxWidth: 500,
             }}
+            className="section-heading"
           >
             Results that speak
           </h2>
@@ -636,6 +644,7 @@ export default function Home() {
         </motion.div>
 
         <div
+          className="stats-grid-3"
           style={{
             display: "grid",
             gridTemplateColumns: "repeat(3, 1fr)",
@@ -648,6 +657,7 @@ export default function Home() {
           <StatCard label="Sharpe Ratio" value={8.46} decimals={2} note="Annualized" i={3} />
         </div>
         <div
+          className="stats-grid-2"
           style={{
             display: "grid",
             gridTemplateColumns: "repeat(2, 1fr)",
@@ -660,6 +670,7 @@ export default function Home() {
         </div>
 
         <div
+          className="info-grid"
           style={{
             display: "grid",
             gridTemplateColumns: "repeat(2, 1fr)",
@@ -688,7 +699,7 @@ export default function Home() {
             >
               Test Information
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+            <div className="info-inner-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
               {[
                 { k: "Period", v: "Sep 2025 – Mar 2026" },
                 { k: "Pairs", v: "15 FX pairs" },
@@ -756,6 +767,7 @@ export default function Home() {
               ].map(({ label, value }) => (
                 <div
                   key={label}
+                  className="signal-row"
                   style={{
                     display: "flex",
                     justifyContent: "space-between",
@@ -791,9 +803,10 @@ export default function Home() {
 
       {/* ══════ CTA ══════ */}
       <section
+        className="cta-section"
         style={{
           padding: "140px 48px",
-          textAlign: "center",
+          textAlign: "center" as const,
           position: "relative",
         }}
       >
@@ -844,6 +857,7 @@ export default function Home() {
               lineHeight: 1.2,
               marginBottom: 20,
             }}
+            className="cta-heading"
           >
             Interested in our signals?
           </motion.h2>
@@ -868,6 +882,7 @@ export default function Home() {
           <motion.div
             variants={fadeUp}
             custom={3}
+            className="cta-buttons"
             style={{ display: "flex", gap: 16, justifyContent: "center" }}
           >
             <a

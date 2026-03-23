@@ -123,7 +123,7 @@ export default function Layout({ children, onContact }: { children: React.ReactN
       <ScrollToTop />
 
       {/* Nav */}
-      <nav style={navStyle}>
+      <nav className="nav-bar" style={navStyle}>
         <Link to="/" style={logoContainerStyle}>
           <img
             src="/logo-transparent.png"
@@ -132,8 +132,9 @@ export default function Layout({ children, onContact }: { children: React.ReactN
           />
         </Link>
 
-        <div style={navLinksStyle}>
+        <div className="nav-links" style={navLinksStyle}>
           <a
+            className="nav-link-text"
             onClick={() => {
               if (window.location.pathname === "/") scrollTo("approach");
               else window.location.href = "/#approach";
@@ -145,6 +146,7 @@ export default function Layout({ children, onContact }: { children: React.ReactN
             Approach
           </a>
           <a
+            className="nav-link-text"
             onClick={() => {
               if (window.location.pathname === "/") scrollTo("performance");
               else window.location.href = "/#performance";
@@ -158,6 +160,7 @@ export default function Layout({ children, onContact }: { children: React.ReactN
           <a
             href="#"
             onClick={(e) => { e.preventDefault(); onContact?.(); }}
+            className="nav-cta"
             style={ctaButtonStyle}
             onMouseEnter={(e) => {
               e.currentTarget.style.background = "rgba(79, 195, 247, 0.08)";
@@ -177,8 +180,8 @@ export default function Layout({ children, onContact }: { children: React.ReactN
       <main>{children}</main>
 
       {/* Footer */}
-      <footer style={footerStyle}>
-        <div style={footerGridStyle}>
+      <footer className="footer-container" style={footerStyle}>
+        <div className="footer-grid" style={footerGridStyle}>
           <div>
             <img
               src="/logo-transparent.png"
@@ -277,7 +280,7 @@ export default function Layout({ children, onContact }: { children: React.ReactN
           </div>
         </div>
 
-        <div style={footerBottomStyle}>
+        <div className="footer-bottom" style={footerBottomStyle}>
           <span
             style={{
               color: "#374151",

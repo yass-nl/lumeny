@@ -56,3 +56,139 @@ body {
   0%, 100% { transform: translateY(0); }
   50% { transform: translateY(-6px); }
 }
+
+/* ─── Mobile responsive ─── */
+@media (max-width: 768px) {
+  /* Nav */
+  .nav-bar {
+    padding: 0 20px !important;
+    height: 60px !important;
+  }
+  .nav-links {
+    gap: 16px !important;
+  }
+  .nav-link-text {
+    display: none !important;
+  }
+  .nav-cta {
+    padding: 8px 16px !important;
+    font-size: 10px !important;
+  }
+
+  /* Sections */
+  .section-container {
+    padding: 80px 24px !important;
+  }
+
+  /* Hero */
+  .hero-container {
+    padding: 0 20px !important;
+  }
+  .hero-title {
+    font-size: 36px !important;
+  }
+  .hero-subtitle {
+    font-size: 13px !important;
+  }
+  .hero-ctas {
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 12px !important;
+  }
+  .hero-ctas a {
+    width: 100% !important;
+    text-align: center !important;
+    max-width: 280px !important;
+  }
+
+  /* Approach grid */
+  .approach-grid {
+    grid-template-columns: 1fr !important;
+    gap: 16px !important;
+  }
+
+  /* Section headings */
+  .section-heading {
+    font-size: 28px !important;
+  }
+
+  /* Stat cards */
+  .stats-grid-3 {
+    grid-template-columns: 1fr !important;
+    gap: 12px !important;
+  }
+  .stats-grid-2 {
+    grid-template-columns: 1fr !important;
+    gap: 12px !important;
+  }
+
+  /* Info grids */
+  .info-grid {
+    grid-template-columns: 1fr !important;
+    gap: 16px !important;
+  }
+  .info-inner-grid {
+    grid-template-columns: 1fr 1fr !important;
+  }
+
+  /* Signal characteristics */
+  .signal-row {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 4px !important;
+  }
+
+  /* CTA section */
+  .cta-section {
+    padding: 80px 24px !important;
+  }
+  .cta-heading {
+    font-size: 28px !important;
+  }
+  .cta-buttons {
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 12px !important;
+  }
+  .cta-buttons a {
+    width: 100% !important;
+    text-align: center !important;
+    max-width: 280px !important;
+  }
+
+  /* Footer */
+  .footer-container {
+    padding: 40px 24px 24px !important;
+  }
+  .footer-grid {
+    grid-template-columns: 1fr !important;
+    gap: 32px !important;
+  }
+  .footer-bottom {
+    flex-direction: column !important;
+    gap: 16px !important;
+    text-align: center !important;
+  }
+  .footer-bottom span {
+    text-align: center !important;
+  }
+
+  /* Legal pages */
+  .legal-page {
+    padding: 120px 20px 80px !important;
+  }
+  .legal-title {
+    font-size: 28px !important;
+  }
+
+  /* Contact modal */
+  .modal-container {
+    margin: 16px !important;
+    padding: 28px 24px !important;
+    max-height: 90vh !important;
+    overflow-y: auto !important;
+  }
+  .modal-form-row {
+    grid-template-columns: 1fr !important;
+  }
+}

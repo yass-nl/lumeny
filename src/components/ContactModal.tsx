@@ -139,6 +139,7 @@ export default function ContactModal({
           }}
         >
           <motion.div
+            className="modal-container"
             style={modalStyle}
             initial={{ opacity: 0, y: 20, scale: 0.97 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -249,6 +250,7 @@ export default function ContactModal({
             ) : (
               <form onSubmit={handleSubmit}>
                 <div
+                  className="modal-form-row"
                   style={{
                     display: "grid",
                     gridTemplateColumns: "1fr 1fr",

@@ -25,6 +25,7 @@ export default function TermsOfService() {
   return (
     <Layout>
       <div
+        className="legal-page"
         style={{
           maxWidth: 720,
           margin: "0 auto",
