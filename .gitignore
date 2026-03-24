@@ -44,3 +44,7 @@ backend/models_3/
 
 notebooks_2/.ipynb_checkpoints/
 notebooks_3/.ipynb_checkpoints/
+
+# Results / output files
+*.txt
+*.output

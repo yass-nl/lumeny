@@ -3,7 +3,7 @@ TradeLocker Bot -- Automated trade execution for LumenY v5.1
 
 Integrates with the paper trading loop:
   1. After log_predictions(), place market orders for tradeable signals
-  2. Every loop iteration, close positions that have reached their 4H maturity
+  2. Every loop iteration, close positions that have reached their 2H maturity
 
 Uses TradeLocker REST API with JWT auth.
 """
@@ -44,11 +44,14 @@ PAIR_TO_SYMBOL = {
 MAX_LOT_SIZE = 0.3            # ideal lot size per trade
 MIN_MARGIN_TO_TRADE = 400     # skip if available margin below this
 
+# Pairs excluded from live trading (signals still generated, just not executed)
+EXCLUDED_PAIRS = {'CHFJPY'}
+
 # Spread filter
 MAX_SPREAD_POINTS = 30        # skip trade if spread exceeds this many points
 
 # How long to hold a position (hours)
-HOLD_HOURS = 4
+HOLD_HOURS = 2
 
 # TradeLocker API returns positions/orders as arrays, not dicts.
 # Column indices from /trade/config:
@@ -337,6 +340,10 @@ class TradeLockerBot:
 
             # Skip if already placed (e.g. from retry)
             if pred_id in self.open_positions:
+                continue 
+
+            if pair in EXCLUDED_PAIRS:
+                logger.info(f'TradeLocker: SKIP {pair} — pair is excluded from live trading')
                 continue
 
             instrument_id = self.instrument_map.get(pair)
@@ -449,36 +456,95 @@ class TradeLockerBot:
             if now >= pos['close_at']:
                 to_close.append(pred_id)
 
+        if not to_close:
+            return
+
+        # Fetch all open positions ONCE to avoid per-position API calls (429 rate limit)
+        all_positions = await self.get_open_positions_list()
+        inst_to_posid = {}
+        for pos in all_positions:
+            if isinstance(pos, list):
+                inst_to_posid[str(pos[POS_INSTRUMENT_ID])] = str(pos[POS_ID])
+            elif isinstance(pos, dict):
+                inst_to_posid[str(pos.get('tradableInstrumentId', ''))] = str(
+                    pos.get('id') or pos.get('positionId')
+                )
+
+        closed_ids = []
+        failed = []
         for pred_id in to_close:
             pos = self.open_positions[pred_id]
             position_id = pos.get('position_id')
 
             if not position_id:
-                logger.warning(
-                    f'TradeLocker: no positionId for pred {pred_id} ({pos["pair"]}), '
-                    f'trying to find it...'
-                )
-                position_id = await self._find_position_by_instrument(pos['instrument_id'])
+                # Look up from the pre-fetched positions list instead of a separate API call
+                position_id = inst_to_posid.get(str(pos['instrument_id']))
+                if position_id:
+                    logger.info(
+                        f'TradeLocker: resolved {pos["pair"]} -> position {position_id} '
+                        f'from cached positions list'
+                    )
 
-            if position_id:
+            if not position_id:
+                failed.append(pred_id)
+                continue
+
+            try:
+                await self._close_position(position_id)
+                logger.info(
+                    f'TradeLocker: closed {pos["pair"]} position {position_id} '
+                    f'(pred_id={pred_id})'
+                )
+                closed_ids.append(pred_id)
+            except Exception as e:
+                logger.error(
+                    f'TradeLocker: failed to close {pos["pair"]} '
+                    f'position {position_id}: {e}'
+                )
+                failed.append(pred_id)
+
+        # Retry failed closes after a short backoff (strategy requires closing on time)
+        if failed:
+            import asyncio
+            logger.info(f'TradeLocker: retrying {len(failed)} failed close(s) after 2s backoff...')
+            await asyncio.sleep(2)
+
+            # Re-fetch positions in case IDs changed after first round of closes
+            all_positions = await self.get_open_positions_list()
+            inst_to_posid = {}
+            for p in all_positions:
+                if isinstance(p, list):
+                    inst_to_posid[str(p[POS_INSTRUMENT_ID])] = str(p[POS_ID])
+                elif isinstance(p, dict):
+                    inst_to_posid[str(p.get('tradableInstrumentId', ''))] = str(
+                        p.get('id') or p.get('positionId')
+                    )
+
+            for pred_id in failed:
+                pos = self.open_positions[pred_id]
+                position_id = pos.get('position_id') or inst_to_posid.get(str(pos['instrument_id']))
+
+                if not position_id:
+                    logger.error(
+                        f'TradeLocker: STILL cannot find position for {pos["pair"]} '
+                        f'(pred_id={pred_id}) after retry — position may need manual close'
+                    )
+                    continue
+
                 try:
                     await self._close_position(position_id)
                     logger.info(
-                        f'TradeLocker: closed {pos["pair"]} position {position_id} '
+                        f'TradeLocker: RETRY closed {pos["pair"]} position {position_id} '
                         f'(pred_id={pred_id})'
                     )
+                    closed_ids.append(pred_id)
                 except Exception as e:
                     logger.error(
-                        f'TradeLocker: failed to close {pos["pair"]} '
-                        f'position {position_id}: {e}'
+                        f'TradeLocker: RETRY failed to close {pos["pair"]} '
+                        f'position {position_id}: {e} — position may need manual close'
                     )
-                    continue
-            else:
-                logger.warning(
-                    f'TradeLocker: could not find position for {pos["pair"]} '
-                    f'(pred_id={pred_id}), may already be closed'
-                )
 
+        for pred_id in closed_ids:
             del self.open_positions[pred_id]
 
     async def _resolve_position_ids(self):

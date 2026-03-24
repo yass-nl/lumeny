@@ -1,7 +1,7 @@
 """
 LumenY -- Paper Trading Tracker v5.1
 
-Single horizon (4H forward), per-pair cooldown, meta-model filtering.
+Single horizon (2H forward), per-pair cooldown, meta-model filtering.
 
 Two jobs:
   1. log_predictions()  -- runs every hour, logs model predictions to SQLite
@@ -52,12 +52,12 @@ logger = logging.getLogger(__name__)
 # -- Constants --
 
 # Entry = 1H close at prediction time (bar T).
-# Exit  = 1H close 4 hours later (bar T+4).
-# matures_at = last_candle_time + 5H (so resolve fires after exit bar closes).
-MATURITY_HOURS = 5
+# Exit  = 1H close 2 hours later (bar T+2).
+# matures_at = last_candle_time + 3H (so resolve fires after exit bar closes).
+MATURITY_HOURS = 3
 
-# Per-pair cooldown: once a trade is logged for a pair, skip that pair for 4 hours.
-COOLDOWN_HOURS = 4
+# Per-pair cooldown: once a trade is logged for a pair, skip that pair for 2 hours.
+COOLDOWN_HOURS = 2
 
 AVG_SPREAD = 0.00028
 
@@ -219,7 +219,7 @@ async def log_predictions(buf):
         logger.info('Market closed (weekend) -- skipping inference.')
         return 0
     # On Friday, skip if the exit candle would not fully close before market
-    # closes (~22:00 UTC). Maturity = last_candle + 5H, exit bar closes at
+    # closes (~22:00 UTC). Maturity = last_candle + 3H, exit bar closes at
     # matures_at, so we need matures_at <= Fri 22:00.  Simpler: skip if
     # now + MATURITY_HOURS lands on Sat/Sun OR on Friday >= 22:00.
     if now.weekday() == 4:
@@ -1125,7 +1125,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div style="display:flex; justify-content:space-between; align-items:center;">
     <div>
       <h1>LumenY Paper Trading v5.1</h1>
-      <div class="subtitle">Microstructure model &mdash; 4H forward, meta-filtered, per-pair cooldown</div>
+      <div class="subtitle">Microstructure model &mdash; 2H forward, meta-filtered, per-pair cooldown</div>
     </div>
     <button class="refresh-btn" onclick="loadData()">Refresh</button>
   </div>
