@@ -3,7 +3,7 @@ TradeLocker Bot -- Automated trade execution for LumenY v5.1
 
 Integrates with the paper trading loop:
   1. After log_predictions(), place market orders for tradeable signals
-  2. Every loop iteration, close positions that have reached their 2H maturity
+  2. Every loop iteration, close positions that have reached their 3H maturity
 
 Uses TradeLocker REST API with JWT auth.
 """
@@ -48,10 +48,10 @@ MIN_MARGIN_TO_TRADE = 400     # skip if available margin below this
 EXCLUDED_PAIRS = {'CHFJPY'}
 
 # Spread filter
-MAX_SPREAD_POINTS = 30        # skip trade if spread exceeds this many points
+MAX_SPREAD_POINTS = 50        # skip trade if spread exceeds this many points
 
 # How long to hold a position (hours)
-HOLD_HOURS = 2
+HOLD_HOURS = 3
 
 # TradeLocker API returns positions/orders as arrays, not dicts.
 # Column indices from /trade/config:
@@ -354,7 +354,7 @@ class TradeLockerBot:
             # Spread check: skip if spread > 30 points
             spread_points = await self._get_spread_points(pair)
             if spread_points is not None and spread_points > MAX_SPREAD_POINTS:
-                logger.info(f'TradeLocker: SKIP {pair} — spread={spread_points:.1f} points > 30')
+                logger.info(f'TradeLocker: SKIP {pair} — spread={spread_points:.1f} points > {MAX_SPREAD_POINTS}')
                 continue
 
             # Check margin and compute lot size

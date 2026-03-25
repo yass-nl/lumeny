@@ -52,12 +52,12 @@ logger = logging.getLogger(__name__)
 # -- Constants --
 
 # Entry = 1H close at prediction time (bar T).
-# Exit  = 1H close 2 hours later (bar T+2).
-# matures_at = last_candle_time + 3H (so resolve fires after exit bar closes).
-MATURITY_HOURS = 3
+# Exit  = 1H close 3 hours later (bar T+3).
+# matures_at = last_candle_time + 4H (so resolve fires after exit bar closes).
+MATURITY_HOURS = 4
 
-# Per-pair cooldown: once a trade is logged for a pair, skip that pair for 2 hours.
-COOLDOWN_HOURS = 2
+# Per-pair cooldown: once a trade is logged for a pair, skip that pair for 3 hours.
+COOLDOWN_HOURS = 3
 
 AVG_SPREAD = 0.00028
 

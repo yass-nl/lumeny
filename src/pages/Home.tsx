@@ -652,9 +652,9 @@ export default function Home() {
             marginBottom: 16,
           }}
         >
-          <StatCard label="Return" value={24.32} suffix="%" decimals={2} prefix="+" note="Over test period" i={1} />
-          <StatCard label="Win Rate" value={68.4} suffix="%" decimals={1} note="468 / 684 trades" i={2} />
-          <StatCard label="Sharpe Ratio" value={8.87} decimals={2} note="Annualized" i={3} />
+          <StatCard label="Return" value={26.56} suffix="%" decimals={2} prefix="+" note="Over test period" i={1} />
+          <StatCard label="Win Rate" value={65.1} suffix="%" decimals={1} note="446 / 685 trades" i={2} />
+          <StatCard label="Sharpe Ratio" value={8.02} decimals={2} note="Annualized" i={3} />
         </div>
         <div
           className="stats-grid-2"
@@ -665,8 +665,8 @@ export default function Home() {
             marginBottom: 32,
           }}
         >
-          <StatCard label="Profit Factor" value={2.43} decimals={2} note="Gross profit / gross loss" i={4} />
-          <StatCard label="Max Drawdown" value={1.80} suffix="%" decimals={2} note="Peak-to-trough" i={5} />
+          <StatCard label="Profit Factor" value={2.18} decimals={2} note="Gross profit / gross loss" i={4} />
+          <StatCard label="Max Drawdown" value={1.55} suffix="%" decimals={2} note="Peak-to-trough" i={5} />
         </div>
 
         <div
@@ -704,7 +704,7 @@ export default function Home() {
                 { k: "Period", v: "Sep 2025 – Mar 2026" },
                 { k: "Pairs", v: "15 FX pairs" },
                 { k: "Avg. trades / day", v: "3.4" },
-                { k: "Total trades", v: "684" },
+                { k: "Total trades", v: "685" },
                 { k: "Leverage", v: "50:1" },
               ].map(({ k, v }) => (
                 <div key={k}>
@@ -761,7 +761,7 @@ export default function Home() {
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {[
-                { label: "Avg. Win / Avg. Loss", value: "1.12x" },
+                { label: "Avg. Win / Avg. Loss", value: "1.17x" },
                 { label: "Consistency", value: "Positive across all test months" },
                 { label: "Methodology", value: "Fully systematic, zero discretion" },
               ].map(({ label, value }) => (

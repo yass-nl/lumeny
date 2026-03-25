@@ -9,7 +9,7 @@ Same pipeline as live backtest v5.2 (features, Q50, meta-model), but with:
 - Actual $ P&L per trade, equity curve, drawdown tracking
 - Spread filter: skip if spread > 30 points
 
-Config: Meta P>0.55 + |Q50|>0.5x spread (same as live bot).
+Config: Meta P>0.55 + |Q50|>0.5x spread. 3H holding period.
 """
 
 import os
@@ -34,8 +34,10 @@ API_KEY = os.getenv('POLYGON_S3_SECRET_KEY', '')
 REST_BASE = 'https://api.polygon.io'
 
 PAIRS = [
+    # Majors
     'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
-    'EURJPY', 'GBPJPY', 'EURGBP', 'EURAUD', 'AUDJPY', 'CADJPY', 'CHFJPY', 'AUDNZD',
+    # Liquid crosses only
+    'EURJPY', 'GBPJPY', 'EURGBP',
 ]
 
 MODELS_DIR = Path('backend/models_5.1/3_quants')
@@ -204,8 +206,8 @@ def compute_slippage_cost_usd(pair, lots, exit_price, hour_utc=12, realized_vol=
 
 # ── Model thresholds (same as live) ──
 AVG_SPREAD = 0.00028
-MIN_Q50_THRESHOLD = AVG_SPREAD * 1.0
-META_THRESHOLD = 0.55
+MIN_Q50_THRESHOLD = AVG_SPREAD * 0.5
+META_THRESHOLD = 0.50
 
 BACKTEST_DAYS = 200   # ~6.5 months
 WARMUP_DAYS = 10
@@ -828,10 +830,10 @@ def compute_features_for_pair(pair, data):
     df_features['pair'] = pair
 
     close_1h = df_1h['close'].reindex(df_features.index, method='ffill')
-    close_1h_2 = df_1h['close'].shift(-2).reindex(df_features.index, method='ffill')
-    df_features['label_1H'] = np.log(close_1h_2 / close_1h)
+    close_1h_3 = df_1h['close'].shift(-3).reindex(df_features.index, method='ffill')
+    df_features['label_1H'] = np.log(close_1h_3 / close_1h)
     df_features['entry_price'] = close_1h
-    df_features['exit_price'] = close_1h_2
+    df_features['exit_price'] = close_1h_3
 
     float_cols = df_features.select_dtypes(include=[np.float64]).columns
     df_features[float_cols] = df_features[float_cols].astype(np.float32)
@@ -898,7 +900,7 @@ def simulate_capital(df_all, backtest_start):
     # Filter: meta P > 0.55 + |Q50| > 0.5x spread
     df_signals = df[(df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)].copy()
 
-    # Apply 2H cooldown per pair
+    # Apply 3H cooldown per pair
     df_signals = df_signals.sort_index()
     pair_unlock_time = {}
     keep = []
@@ -909,7 +911,7 @@ def simulate_capital(df_all, backtest_start):
             keep.append(False)
         else:
             keep.append(True)
-            pair_unlock_time[pair] = idx + pd.Timedelta(hours=2)
+            pair_unlock_time[pair] = idx + pd.Timedelta(hours=3)
     df_signals = df_signals[keep].copy()
 
     print(f'\n{"="*80}')
@@ -1023,7 +1025,7 @@ def simulate_capital(df_all, backtest_start):
                     'exit_price': exit_price_2h,
                     'margin_used': margin_needed,
                     'open_at': hour,
-                    'close_at': hour + pd.Timedelta(hours=2),
+                    'close_at': hour + pd.Timedelta(hours=3),
                     'meta_proba': meta_p,
                     'q50': q50,
                     'realized_vol': ann_vol,
