@@ -40,17 +40,24 @@ PAIRS = [
     'EURJPY', 'GBPJPY', 'EURGBP',
 ]
 
-MODELS_DIR = Path('backend/models_5.1/3_quants')
-META_DIR   = Path('backend/models_5.1/meta')
+MODELS_DIR = Path('backend/models_6/3_quants')
+META_DIR   = Path('backend/models_6/meta')
 
 # ── Capital simulation parameters ──
-STARTING_CAPITAL = 100_000.0
-LOT_SIZE_DEFAULT = 1.0     # 1 lot when < 5 concurrent positions
-LOT_SIZE_REDUCED = 0.5     # 0.5 lots when >= 5 concurrent positions
-MAX_CONCURRENT_FULL_LOT = 5
+STARTING_CAPITAL = 1_000_000.0
 LOT_UNITS = 100_000       # 1 standard lot = 100,000 units
-MIN_MARGIN_TO_TRADE = 400
+MIN_MARGIN_TO_TRADE = 4_000
 MAX_SPREAD_POINTS = 50
+RISK_PER_TRADE = 0.005    # 0.5% of equity per trade
+
+# Market capacity caps (lots) — from BIS 2022 analysis, 50% of 1% hourly volume / 4 simultaneous
+# Binding constraint is always the illiquid crosses
+CAPACITY_CAPS = {
+    'EURUSD': 139, 'GBPUSD': 58,  'USDJPY': 83,  'USDCHF': 13,
+    'AUDUSD': 24,  'USDCAD': 18,  'NZDUSD': 6,
+    'EURJPY': 11,  'GBPJPY': 8,   'EURGBP': 9,
+    'EURAUD': 3,   'AUDJPY': 3,   'CADJPY': 1,   'CHFJPY': 2,   'AUDNZD': 1,
+}
 
 MAJORS = {'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD'}
 CROSSES = {'EURJPY', 'GBPJPY', 'EURGBP', 'EURAUD', 'AUDJPY', 'CADJPY', 'CHFJPY', 'AUDNZD'}
@@ -67,6 +74,13 @@ SPREAD_POINTS = {
 }
 
 JPY_PAIRS = {'USDJPY', 'EURJPY', 'GBPJPY', 'AUDJPY', 'CADJPY', 'CHFJPY'}
+
+PIP_SIZE = {
+    'EURUSD': 0.0001, 'GBPUSD': 0.0001, 'AUDUSD': 0.0001, 'NZDUSD': 0.0001,
+    'USDCAD': 0.0001, 'USDCHF': 0.0001, 'USDJPY': 0.01,
+    'EURJPY': 0.01, 'GBPJPY': 0.01, 'EURGBP': 0.0001, 'EURAUD': 0.0001,
+    'AUDJPY': 0.01, 'CADJPY': 0.01, 'CHFJPY': 0.01, 'AUDNZD': 0.0001,
+}
 
 # At 21:00-23:00 UTC — off-hours multipliers calibrated from Polygon (off-hours median / liquid median)
 OFFHOUR_SPREAD_MULTIPLIER = {
@@ -158,19 +172,17 @@ SLIPPAGE_TIME_MULTIPLIER = {
     'AUDJPY': 2.5, 'CADJPY': 2.5, 'CHFJPY': 3.0, 'AUDNZD': 2.5,
 }
 
-def get_slippage_points(pair, hour_utc, realized_vol=None):
-    """Slippage = base × time_multiplier × volatility_multiplier."""
+def get_slippage_points(pair, hour_utc, realized_vol=None, lots=1.0):
+    """Slippage = base × time_multiplier × volatility_multiplier × size_multiplier."""
     base = SLIPPAGE_BASE_POINTS.get(pair, 1.0)
 
-    # Time multiplier (21-22 UTC = off-hours)
+    # Time multiplier (21-22 UTC = post-NY close, thinnest books)
     if hour_utc in (21, 22):
         time_mult = SLIPPAGE_TIME_MULTIPLIER.get(pair, 2.0)
     else:
         time_mult = 1.0
 
     # Volatility multiplier: high vol = more slippage (books thin out)
-    # realized_vol is annualized; typical forex ~8-12% for majors
-    # Scale: <8% → 0.8x, 8-15% → 1.0x, 15-25% → 1.5x, >25% → 2.0x
     vol_mult = 1.0
     if realized_vol is not None and realized_vol > 0:
         if realized_vol < 0.08:
@@ -182,10 +194,14 @@ def get_slippage_points(pair, hour_utc, realized_vol=None):
         else:
             vol_mult = 2.0
 
-    return base * time_mult * vol_mult
+    # Size multiplier: larger positions walk the book
+    # +5% per lot above 1, capped at 3x
+    size_mult = min(1.0 + 0.05 * max(lots - 1.0, 0), 3.0)
 
-def slippage_in_price(pair, hour_utc, realized_vol=None):
-    pts = get_slippage_points(pair, hour_utc, realized_vol)
+    return base * time_mult * vol_mult * size_mult
+
+def slippage_in_price(pair, hour_utc, realized_vol=None, lots=1.0):
+    pts = get_slippage_points(pair, hour_utc, realized_vol, lots)
     if pair in JPY_PAIRS:
         return pts * 0.001
     else:
@@ -193,7 +209,7 @@ def slippage_in_price(pair, hour_utc, realized_vol=None):
 
 def compute_slippage_cost_usd(pair, lots, exit_price, hour_utc=12, realized_vol=None):
     """Compute slippage cost in USD."""
-    sp = slippage_in_price(pair, hour_utc, realized_vol)
+    sp = slippage_in_price(pair, hour_utc, realized_vol, lots)
     quote_ccy = pair[3:]
     if pair in JPY_PAIRS:
         return lots * LOT_UNITS * sp / exit_price
@@ -206,20 +222,21 @@ def compute_slippage_cost_usd(pair, lots, exit_price, hour_utc=12, realized_vol=
 
 # ── Model thresholds (same as live) ──
 AVG_SPREAD = 0.00028
-MIN_Q50_THRESHOLD = AVG_SPREAD * 0.5
+MIN_Q50_THRESHOLD = AVG_SPREAD * 0.7
 META_THRESHOLD = 0.50
 
 BACKTEST_DAYS = 200   # ~6.5 months
 WARMUP_DAYS = 10
 TOTAL_FETCH_DAYS = BACKTEST_DAYS + WARMUP_DAYS
+DATE_OFFSET_DAYS = 200  # shift window back by N days (0 = current, 200 = previous 6 months)
 
 print(f'Capital Simulation — Realistic P&L')
 print(f'  Starting capital: ${STARTING_CAPITAL:,.0f}')
-print(f'  Lot size: {LOT_SIZE_DEFAULT} (reduces to {LOT_SIZE_REDUCED} when >= {MAX_CONCURRENT_FULL_LOT} positions open)')
+print(f'  Lot sizing: ATR-based (0.5% risk/trade) with per-pair capacity caps')
 print(f'  Max spread: {MAX_SPREAD_POINTS} points')
 print(f'  Meta threshold: {META_THRESHOLD}')
 print(f'  Q50 threshold: {MIN_Q50_THRESHOLD}')
-print(f'  Fetch window: {TOTAL_FETCH_DAYS} days')
+print(f'  Fetch window: {TOTAL_FETCH_DAYS} days (offset: {DATE_OFFSET_DAYS} days back)')
 
 
 # ──────────────────────────────────────────────
@@ -258,7 +275,7 @@ async def fetch_bars(pair, multiplier, timespan, from_date, to_date, limit=50000
 
 
 async def fetch_all_pairs():
-    now = datetime.utcnow()
+    now = datetime.utcnow() - timedelta(days=DATE_OFFSET_DAYS)
     to_date = now.strftime('%Y-%m-%d')
     from_date = (now - timedelta(days=TOTAL_FETCH_DAYS)).strftime('%Y-%m-%d')
 
@@ -788,6 +805,93 @@ def compute_trailing_features(df_hourly, returns_1m_dict):
     return df_hourly
 
 
+def compute_contextual_features(df_features, df_1h, pair):
+    """Compute features_6 contextual features on top of microstructure features.
+
+    Mirrors exactly: notebooks_6/01_big_move_detection.ipynb → compute_extra_features()
+    """
+    pip = PIP_SIZE.get(pair, 0.0001)
+    feat = pd.DataFrame(index=df_features.index)
+
+    # Align 1H OHLCV to feature index
+    df_1h = df_1h.reindex(df_features.index)
+    o = df_1h['open']
+    h = df_1h['high']
+    l = df_1h['low']
+    c = df_1h['close']
+    v = df_1h['volume']
+
+    # ── ATR CONTEXT ──
+    tr = np.maximum(h - l, np.maximum(np.abs(h - c.shift(1)), np.abs(l - c.shift(1))))
+    feat['atr_6'] = tr.rolling(6, min_periods=3).mean() / pip
+    feat['atr_24'] = tr.rolling(24, min_periods=6).mean() / pip
+    feat['atr_72'] = tr.rolling(72, min_periods=24).mean() / pip
+    feat['atr_ratio_6_24'] = feat['atr_6'] / feat['atr_24'].clip(lower=1e-10)
+    feat['atr_ratio_6_72'] = feat['atr_6'] / feat['atr_72'].clip(lower=1e-10)
+
+    # ── RANGE POSITION ──
+    high_24 = h.rolling(24, min_periods=6).max()
+    low_24 = l.rolling(24, min_periods=6).min()
+    range_24 = high_24 - low_24
+    feat['range_pos_24'] = (c - low_24) / range_24.clip(lower=1e-10)
+    feat['range_width_24'] = range_24 / pip
+
+    high_48 = h.rolling(48, min_periods=12).max()
+    low_48 = l.rolling(48, min_periods=12).min()
+    range_48 = high_48 - low_48
+    feat['range_pos_48'] = (c - low_48) / range_48.clip(lower=1e-10)
+    feat['range_width_48'] = range_48 / pip
+
+    atr_price = tr.rolling(24, min_periods=6).mean()
+    feat['dist_from_24h_high'] = (high_24 - c) / atr_price.clip(lower=1e-10)
+    feat['dist_from_24h_low'] = (c - low_24) / atr_price.clip(lower=1e-10)
+
+    # ── SESSION FLAGS ──
+    hour = df_features.index.hour
+    feat['hour_sin'] = np.sin(2 * np.pi * hour / 24)
+    feat['hour_cos'] = np.cos(2 * np.pi * hour / 24)
+    feat['dow_sin'] = np.sin(2 * np.pi * df_features.index.dayofweek / 5)
+    feat['dow_cos'] = np.cos(2 * np.pi * df_features.index.dayofweek / 5)
+    feat['is_london'] = ((hour >= 7) & (hour < 16)).astype(np.float32)
+    feat['is_ny'] = ((hour >= 13) & (hour < 22)).astype(np.float32)
+    feat['is_overlap'] = ((hour >= 13) & (hour < 16)).astype(np.float32)
+    feat['is_asia'] = ((hour >= 0) & (hour < 7)).astype(np.float32)
+
+    # ── CANDLE STRUCTURE ──
+    body = (c - o).abs()
+    full_range = (h - l).clip(lower=1e-10)
+    feat['body_ratio'] = body / full_range
+    feat['upper_wick_ratio'] = (h - np.maximum(o, c)) / full_range
+    feat['lower_wick_ratio'] = (np.minimum(o, c) - l) / full_range
+    feat['candle_direction'] = np.sign(c - o)
+
+    direction = feat['candle_direction']
+    feat['consec_bullish'] = direction.rolling(6, min_periods=1).apply(
+        lambda x: (x > 0).sum(), raw=True)
+    feat['consec_bearish'] = direction.rolling(6, min_periods=1).apply(
+        lambda x: (x < 0).sum(), raw=True)
+
+    # ── FEATURE MOMENTUM (deltas of key microstructure features) ──
+    key_features = ['hurst_6h', 'vr_5', 'entropy_norm', 'order_imbalance',
+                    'kyle_lambda', 'jump_ratio', 'rv_yang_zhang']
+    for col in key_features:
+        if col in df_features.columns:
+            series = df_features[col]
+            feat[f'{col}_delta_3h'] = series.diff(3)
+            feat[f'{col}_delta_6h'] = series.diff(6)
+            feat[f'{col}_delta_12h'] = series.diff(12)
+
+    # ── VOLUME CONTEXT ──
+    feat['volume_ratio_6'] = v / v.rolling(6, min_periods=2).mean().clip(lower=1)
+    feat['volume_ratio_24'] = v / v.rolling(24, min_periods=6).mean().clip(lower=1)
+
+    # Convert to float32
+    for col in feat.columns:
+        feat[col] = feat[col].astype(np.float32)
+
+    return feat
+
+
 def compute_features_for_pair(pair, data):
     df_1m = data[pair]['1m']
     df_5m = data[pair]['5m']
@@ -828,6 +932,10 @@ def compute_features_for_pair(pair, data):
     df_features = pd.DataFrame(all_features).set_index('datetime').sort_index()
     df_features = compute_trailing_features(df_features, returns_1m_dict)
     df_features['pair'] = pair
+
+    # Add contextual features (features_6)
+    df_extra = compute_contextual_features(df_features, df_1h, pair)
+    df_features = df_features.join(df_extra, how='left')
 
     close_1h = df_1h['close'].reindex(df_features.index, method='ffill')
     close_1h_3 = df_1h['close'].shift(-3).reindex(df_features.index, method='ffill')
@@ -886,6 +994,23 @@ def run_inference(df_all):
     print(f'  Tradeable (|Q50|>0.5x): {tradeable_mask.sum():,}')
     print(f'  Meta-accepted (P>{META_THRESHOLD}): {meta_accepted.sum():,}')
 
+    # Diagnostic: hourly distribution — base model vs meta model
+    print(f'\n--- Hourly Distribution: Base Model vs Meta ---')
+    print(f'{"Hour UTC":<10} {"Base(Q50)":>10} {"%":>6} {"Meta P>0.5":>12} {"%":>6} {"Meta/Base":>10}')
+    print('-' * 58)
+    base_hours = df_all[tradeable_mask].index.hour.value_counts().sort_index()
+    meta_hours = df_all[meta_accepted].index.hour.value_counts().sort_index()
+    base_total = tradeable_mask.sum()
+    meta_total = meta_accepted.sum()
+    for h in range(24):
+        b = base_hours.get(h, 0)
+        m = meta_hours.get(h, 0)
+        b_pct = 100 * b / base_total if base_total > 0 else 0
+        m_pct = 100 * m / meta_total if meta_total > 0 else 0
+        ratio = m / b if b > 0 else 0
+        if b > 0 or m > 0:
+            print(f'{h:02d}:00     {b:>10} {b_pct:>5.1f}% {m:>12} {m_pct:>5.1f}% {ratio:>9.1%}')
+
     return df_all
 
 
@@ -897,8 +1022,11 @@ def simulate_capital(df_all, backtest_start):
     df = df_all[df_all.index >= backtest_start].copy()
     df = df[df['label_1H'].notna()].copy()
 
-    # Filter: meta P > 0.55 + |Q50| > 0.5x spread
-    df_signals = df[(df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)].copy()
+    # Dynamic config: meta P>0.5 + Q50>0.7x spread, OR bypass meta if Q50>1x spread
+    HIGH_CONV_THRESHOLD = AVG_SPREAD * 1.0
+    meta_path = (df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)
+    high_conv_path = df['abs_Q50'] > HIGH_CONV_THRESHOLD
+    df_signals = df[meta_path | high_conv_path].copy()
 
     # Apply 3H cooldown per pair
     df_signals = df_signals.sort_index()
@@ -995,20 +1123,37 @@ def simulate_capital(df_all, backtest_start):
                 if available < MIN_MARGIN_TO_TRADE:
                     continue
 
-                # Lot size: 1.0 if < 5 open, 0.5 if >= 5 open
-                target_lots = LOT_SIZE_DEFAULT if len(open_positions) < MAX_CONCURRENT_FULL_LOT else LOT_SIZE_REDUCED
+                # ATR-based position sizing with market capacity cap
+                atr_pips = float(sig.get('atr_24', np.nan))
+                pip = PIP_SIZE.get(pair, 0.0001)
+                quote_ccy = pair[3:]
+                if pair in JPY_PAIRS:
+                    pip_value_per_lot = LOT_UNITS * pip / entry_price  # USD per pip per lot
+                elif quote_ccy == 'USD':
+                    pip_value_per_lot = LOT_UNITS * pip
+                else:
+                    pip_value_per_lot = LOT_UNITS * pip * QUOTE_USD.get(quote_ccy, 1.0)
+
+                risk_usd = equity * RISK_PER_TRADE
+                if pd.notna(atr_pips) and atr_pips > 0 and pip_value_per_lot > 0:
+                    target_lots = risk_usd / (atr_pips * pip_value_per_lot)
+                else:
+                    target_lots = 1.0  # fallback
+
+                # Apply market capacity cap
+                cap = CAPACITY_CAPS.get(pair, 10)
+                target_lots = min(target_lots, cap)
+                target_lots = max(round(target_lots, 1), 0.1)
 
                 # Check margin and scale down if needed
                 margin_needed = margin_required(pair, target_lots)
-                if margin_needed <= available:
-                    lots = target_lots
-                else:
+                if margin_needed > available:
                     base_ccy = pair[:3]
                     base_val = BASE_USD.get(base_ccy, 1.0)
                     affordable = available * LEVERAGE[pair] / (LOT_UNITS * base_val)
-                    lots = min(target_lots, round(affordable, 2))
-                    lots = max(lots, 0.01)
-                    margin_needed = margin_required(pair, lots)
+                    target_lots = max(round(min(target_lots, affordable), 1), 0.1)
+                    margin_needed = margin_required(pair, target_lots)
+                lots = target_lots
 
                 if margin_needed > available:
                     continue

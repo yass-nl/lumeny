@@ -168,6 +168,7 @@ def _run_inference_sync(buf) -> tuple[dict, dict]:
             df_1m = ohlcv['1m']
             df_5m = ohlcv['5m']
             df_15m = ohlcv['15m']
+            df_1h = ohlcv.get('1H')
 
             if len(df_1m) < 120:  # need at least ~2 hours of 1m data
                 logger.warning(f'Insufficient 1m data for {pair}: {len(df_1m)} bars')
@@ -176,8 +177,8 @@ def _run_inference_sync(buf) -> tuple[dict, dict]:
             # Note: data_service.py already filters out incomplete bars,
             # so no additional drop needed here.
 
-            # Compute microstructure features
-            features_df = compute_features_for_pair(pair, df_1m, df_5m, df_15m)
+            # Compute microstructure + contextual features
+            features_df = compute_features_for_pair(pair, df_1m, df_5m, df_15m, df_1h)
 
             if features_df.empty:
                 logger.warning(f'Empty features for {pair}')
@@ -236,6 +237,7 @@ async def log_predictions(buf):
     logged = 0
     skipped_cooldown = 0
     errors = []
+    last_candle_time = now  # fallback if predictions is empty
 
     # Get pairs on cooldown
     cooldown_pairs = _get_cooldown_pairs(conn, now)
@@ -629,10 +631,10 @@ async def run_loop():
         except Exception as e:
             logger.error(f'Loop error: {e}', exc_info=True)
 
-        # Sleep until XX:00:30 of the next hour — run as early as possible
+        # Sleep until XX:00:10 of the next hour — run as early as possible
         # after the 1H candle closes to minimize position entry delay.
         now = datetime.now(timezone.utc)
-        next_run = (now + timedelta(hours=1)).replace(minute=0, second=30, microsecond=0)
+        next_run = (now + timedelta(hours=1)).replace(minute=0, second=10, microsecond=0)
         if next_run <= now:
             next_run += timedelta(hours=1)
         sleep_secs = (next_run - now).total_seconds()

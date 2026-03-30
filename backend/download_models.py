@@ -2,7 +2,7 @@
 Download models from Cloudflare R2 (private bucket) to the local volume.
 Runs once at container startup if models are not already present.
 
-v5.1: 3 quantile models (Q25/Q50/Q75) + 1 meta-model.
+v6.0: 3 quantile models (Q25/Q50/Q75) + 1 meta-model.
 """
 
 import os
@@ -21,8 +21,7 @@ FILES = [
 
 def download():
     # Always re-download to ensure latest models from R2
-    missing = FILES
-    print(f"Downloading {len(missing)} model(s) from R2...")
+    print(f"Downloading {len(FILES)} model(s) from R2...")
 
     account_id = os.environ["R2_ACCOUNT_ID"]
     access_key = os.environ["R2_ACCESS_KEY_ID"]
@@ -39,7 +38,7 @@ def download():
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    for fname in missing:
+    for fname in FILES:
         dest = MODELS_DIR / fname
         print(f"Downloading {fname}...")
         s3.download_file(bucket, fname, str(dest))

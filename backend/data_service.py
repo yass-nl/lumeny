@@ -18,6 +18,7 @@ import pandas as pd
 import websockets
 
 from features import PAIRS, resample_ohlcv
+import candle_store
 
 logger = logging.getLogger(__name__)
 
@@ -91,9 +92,9 @@ async def fetch_historical_bars(
 class CandleBuffer:
     """
     Maintains in-memory OHLCV buffers for all pairs and timeframes.
-    Provides the data needed for microstructure feature computation.
+    Backed by a SQLite candle store so that on restart / each cycle
+    we only fetch NEW candles from Polygon instead of re-downloading 7 days.
 
-    Fetches: 1m (3 days), 5m (3 days), 15m (7 days), 1H (30 days).
     1m/5m/15m are needed for compute_features_for_pair().
     1H is needed for entry/exit price references and resolution.
     """
@@ -105,54 +106,80 @@ class CandleBuffer:
 
     async def initialize(self):
         """
-        Load enough historical data to compute microstructure features.
-        Fetches 1m (7 days) and resamples 5m/15m locally to match training pipeline.
-        1H fetched separately for entry/exit price lookup (not used for features).
+        Load 1m candles from the SQLite store, fetch only what's missing
+        from Polygon, persist new candles, build in-memory buffers.
+        1H fetched separately (for entry/exit prices, not features).
         """
-        logger.info('Initializing candle buffers from Polygon REST...')
+        candle_store.setup()
+        logger.info('Initializing candle buffers (DB-backed)...')
 
         now = datetime.now(timezone.utc)
         to_date = now.strftime('%Y-%m-%d')
         now_naive = now.replace(tzinfo=None)
 
-        # 1m: 7 days to give enough data for 15m features and trailing warmup
-        # 1H: 30 days for entry/exit price lookup / resolution
-        from_date_1m = (now - timedelta(days=7)).strftime('%Y-%m-%d')
+        # Full backfill window: 96h calendar time = enough to cover weekend gap + 25h trading data
+        backfill_from = (now - timedelta(hours=candle_store.KEEP_HOURS))
+        # 1H: 30 days for entry/exit price lookup
         from_date_1h = (now - timedelta(days=30)).strftime('%Y-%m-%d')
 
         for pair in PAIRS:
-            logger.info(f'  Fetching {pair}...')
             self.buffers[pair] = {}
 
-            # Fetch 1m bars
-            await asyncio.sleep(0.3)
+            # --- 1m: DB-backed incremental fetch ---
             try:
-                df_1m = await fetch_historical_bars(pair, 1, 'minute', from_date_1m, to_date)
-                if not df_1m.empty:
-                    # Filter weekends
-                    df_1m = df_1m[~((df_1m.index.dayofweek == 5) |
-                                    ((df_1m.index.dayofweek == 6) & (df_1m.index.hour < 21)))]
-                    # Drop bars that haven't fully closed yet
-                    df_1m = df_1m[df_1m.index + timedelta(minutes=1) <= now_naive]
-                    self.buffers[pair]['1m'] = df_1m
-                    logger.info(f'    {pair} 1m: {len(df_1m)} candles ({df_1m.index[0].date()} to {df_1m.index[-1].date()})')
+                last_ts = candle_store.get_last_timestamp(pair)
+                n_stored = candle_store.count(pair)
 
-                    # Resample 5m/15m from 1m — matches training and backtest pipeline
+                # Need backfill if: no data, last candle too old, or not enough candles
+                # (< 1440 = less than 24h of 1m bars, meaning DB is incomplete)
+                needs_backfill = (
+                    last_ts is None
+                    or last_ts < backfill_from.replace(tzinfo=None)
+                    or n_stored < 1440
+                )
+
+                if needs_backfill:
+                    # Cold start or insufficient data: backfill full window
+                    from_date_1m = backfill_from.strftime('%Y-%m-%d')
+                    logger.info(f'  {pair} 1m: backfilling from {from_date_1m} (stored={n_stored})...')
+                    await asyncio.sleep(0.3)
+                    df_new = await fetch_historical_bars(pair, 1, 'minute', from_date_1m, to_date)
+                else:
+                    # Incremental: fetch only since last stored candle
+                    # Polygon REST requires YYYY-MM-DD (not datetime) for from/to params
+                    fetch_from = (last_ts - timedelta(minutes=5))
+                    from_str = fetch_from.strftime('%Y-%m-%d')
+                    logger.info(f'  {pair} 1m: incremental from {from_str} ({int((now_naive - last_ts).total_seconds() / 60)} min gap)...')
+                    await asyncio.sleep(0.15)
+                    df_new = await fetch_historical_bars(pair, 1, 'minute', from_str, to_date)
+
+                # Filter weekends and persist new candles
+                if not df_new.empty:
+                    df_new = df_new[~((df_new.index.dayofweek == 5) |
+                                      ((df_new.index.dayofweek == 6) & (df_new.index.hour < 21)))]
+                    df_new = df_new[df_new.index + timedelta(minutes=1) <= now_naive]
+                    candle_store.append_candles(pair, df_new)
+
+                # Load full working window from DB
+                df_1m = candle_store.get_candles(pair)
+                if not df_1m.empty:
+                    self.buffers[pair]['1m'] = df_1m
+                    logger.info(f'    {pair} 1m: {len(df_1m)} candles in buffer ({df_1m.index[0]} to {df_1m.index[-1]})')
+
+                    # Resample 5m/15m from 1m — matches training pipeline
                     df_5m = resample_ohlcv(df_1m, '5min')
                     df_15m = resample_ohlcv(df_1m, '15min')
-                    # Drop incomplete bars
                     df_5m = df_5m[df_5m.index + timedelta(minutes=5) <= now_naive]
                     df_15m = df_15m[df_15m.index + timedelta(minutes=15) <= now_naive]
                     self.buffers[pair]['5m'] = df_5m
                     self.buffers[pair]['15m'] = df_15m
-                    logger.info(f'    {pair} 5m: {len(df_5m)} candles (resampled from 1m)')
-                    logger.info(f'    {pair} 15m: {len(df_15m)} candles (resampled from 1m)')
                 else:
-                    logger.warning(f'    {pair} 1m: no data')
-            except Exception as e:
-                logger.warning(f'    {pair} 1m error: {e}')
+                    logger.warning(f'    {pair} 1m: no data in store')
 
-            # Fetch 1H separately (for entry/exit prices, not features)
+            except Exception as e:
+                logger.warning(f'    {pair} 1m error: {e}', exc_info=True)
+
+            # --- 1H: still fetched from Polygon (for entry/exit prices, not features) ---
             await asyncio.sleep(0.3)
             try:
                 df_1h = await fetch_historical_bars(pair, 1, 'hour', from_date_1h, to_date)
@@ -161,14 +188,16 @@ class CandleBuffer:
                                     ((df_1h.index.dayofweek == 6) & (df_1h.index.hour < 21)))]
                     df_1h = df_1h[df_1h.index + timedelta(minutes=60) <= now_naive]
                     self.buffers[pair]['1H'] = df_1h
-                    logger.info(f'    {pair} 1H: {len(df_1h)} candles ({df_1h.index[0].date()} to {df_1h.index[-1].date()})')
                 else:
                     logger.warning(f'    {pair} 1H: no data')
             except Exception as e:
                 logger.warning(f'    {pair} 1H error: {e}')
 
+        # Trim old candles from the DB
+        candle_store.trim()
+
         self._initialized = True
-        logger.info('Candle buffers initialized.')
+        logger.info('Candle buffers initialized (DB-backed).')
 
     def get_ohlcv(self, pair: str) -> dict[str, pd.DataFrame]:
         """Get all timeframe buffers for a pair."""
@@ -207,6 +236,16 @@ class CandleBuffer:
             'volume': candle.get('volume', 0),
         }
         new_row = pd.DataFrame([row_data], index=[ts])
+
+        # Persist to SQLite store (duplicate-safe)
+        try:
+            candle_store.append_single_candle(
+                pair, ts.to_pydatetime(),
+                candle['open'], candle['high'], candle['low'], candle['close'],
+                candle.get('volume', 0),
+            )
+        except Exception as e:
+            logger.debug(f'candle_store append error for {pair}: {e}')
 
         # Append to 1m buffer directly
         if '1m' in self.buffers[pair]:

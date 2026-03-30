@@ -83,7 +83,7 @@ async def _run_predictions_all():
         try:
             ohlcv = candle_buffer.get_ohlcv(pair)
 
-            # Need 1m, 5m, 15m for microstructure features
+            # Need 1m, 5m, 15m for microstructure features + 1H for contextual
             if '1m' not in ohlcv or '5m' not in ohlcv or '15m' not in ohlcv:
                 logger.warning(f'Missing sub-hourly data for {pair}, skipping prediction.')
                 continue
@@ -91,6 +91,7 @@ async def _run_predictions_all():
             df_1m = ohlcv['1m']
             df_5m = ohlcv['5m']
             df_15m = ohlcv['15m']
+            df_1h = ohlcv.get('1H')
 
             if len(df_1m) < 120:
                 logger.warning(f'Insufficient 1m data for {pair}: {len(df_1m)} bars')
@@ -100,8 +101,10 @@ async def _run_predictions_all():
             df_1m = df_1m.iloc[:-1] if len(df_1m) > 1 else df_1m
             df_5m = df_5m.iloc[:-1] if len(df_5m) > 1 else df_5m
             df_15m = df_15m.iloc[:-1] if len(df_15m) > 1 else df_15m
+            if df_1h is not None and len(df_1h) > 1:
+                df_1h = df_1h.iloc[:-1]
 
-            features_df = compute_features_for_pair(pair, df_1m, df_5m, df_15m)
+            features_df = compute_features_for_pair(pair, df_1m, df_5m, df_15m, df_1h)
 
             if features_df.empty:
                 continue

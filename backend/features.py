@@ -1,6 +1,7 @@
 """
-Feature engineering v5.1 — 64 microstructure features from 1-min OHLCV.
-Exact replica of notebooks_5.1/02_microstructure_features.ipynb.
+Feature engineering v6.0 — 112 features (64 microstructure + 48 contextual).
+Microstructure: exact replica of notebooks_5.1/02_microstructure_features.ipynb.
+Contextual: mirrors notebooks_6/01_big_move_detection.ipynb → compute_extra_features().
 """
 
 import numpy as np
@@ -15,6 +16,13 @@ PAIRS = [
     # Crosses
     'EURJPY', 'GBPJPY', 'EURGBP', 'EURAUD', 'AUDJPY', 'CADJPY', 'CHFJPY', 'AUDNZD',
 ]
+
+PIP_SIZE = {
+    'EURUSD': 0.0001, 'GBPUSD': 0.0001, 'AUDUSD': 0.0001, 'NZDUSD': 0.0001,
+    'USDCAD': 0.0001, 'USDCHF': 0.0001, 'USDJPY': 0.01,
+    'EURJPY': 0.01, 'GBPJPY': 0.01, 'EURGBP': 0.0001, 'EURAUD': 0.0001,
+    'AUDJPY': 0.01, 'CADJPY': 0.01, 'CHFJPY': 0.01, 'AUDNZD': 0.0001,
+}
 
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -521,10 +529,98 @@ def compute_trailing_features(df_hourly, returns_1m_dict):
     return df_hourly
 
 
-def compute_features_for_pair(pair, df_1m, df_5m, df_15m):
+def compute_contextual_features(df_features, df_1h, pair):
+    """Compute features_6 contextual features on top of microstructure features.
+
+    Mirrors exactly: notebooks_6/01_big_move_detection.ipynb → compute_extra_features()
     """
-    Compute microstructure features for one pair from OHLCV data.
-    Returns a DataFrame indexed by hour timestamps with all 64 features.
+    pip = PIP_SIZE.get(pair, 0.0001)
+    feat = pd.DataFrame(index=df_features.index)
+
+    # Align 1H OHLCV to feature index
+    df_1h = df_1h.reindex(df_features.index)
+    o = df_1h['open']
+    h = df_1h['high']
+    l = df_1h['low']
+    c = df_1h['close']
+    v = df_1h['volume']
+
+    # ── ATR CONTEXT ──
+    tr = np.maximum(h - l, np.maximum(np.abs(h - c.shift(1)), np.abs(l - c.shift(1))))
+    feat['atr_6'] = tr.rolling(6, min_periods=3).mean() / pip
+    feat['atr_24'] = tr.rolling(24, min_periods=6).mean() / pip
+    feat['atr_72'] = tr.rolling(72, min_periods=24).mean() / pip
+    feat['atr_ratio_6_24'] = feat['atr_6'] / feat['atr_24'].clip(lower=1e-10)
+    feat['atr_ratio_6_72'] = feat['atr_6'] / feat['atr_72'].clip(lower=1e-10)
+
+    # ── RANGE POSITION ──
+    high_24 = h.rolling(24, min_periods=6).max()
+    low_24 = l.rolling(24, min_periods=6).min()
+    range_24 = high_24 - low_24
+    feat['range_pos_24'] = (c - low_24) / range_24.clip(lower=1e-10)
+    feat['range_width_24'] = range_24 / pip
+
+    high_48 = h.rolling(48, min_periods=12).max()
+    low_48 = l.rolling(48, min_periods=12).min()
+    range_48 = high_48 - low_48
+    feat['range_pos_48'] = (c - low_48) / range_48.clip(lower=1e-10)
+    feat['range_width_48'] = range_48 / pip
+
+    atr_price = tr.rolling(24, min_periods=6).mean()
+    feat['dist_from_24h_high'] = (high_24 - c) / atr_price.clip(lower=1e-10)
+    feat['dist_from_24h_low'] = (c - low_24) / atr_price.clip(lower=1e-10)
+
+    # ── SESSION FLAGS ──
+    hour = df_features.index.hour
+    feat['hour_sin'] = np.sin(2 * np.pi * hour / 24)
+    feat['hour_cos'] = np.cos(2 * np.pi * hour / 24)
+    feat['dow_sin'] = np.sin(2 * np.pi * df_features.index.dayofweek / 5)
+    feat['dow_cos'] = np.cos(2 * np.pi * df_features.index.dayofweek / 5)
+    feat['is_london'] = ((hour >= 7) & (hour < 16)).astype(np.float32)
+    feat['is_ny'] = ((hour >= 13) & (hour < 22)).astype(np.float32)
+    feat['is_overlap'] = ((hour >= 13) & (hour < 16)).astype(np.float32)
+    feat['is_asia'] = ((hour >= 0) & (hour < 7)).astype(np.float32)
+
+    # ── CANDLE STRUCTURE ──
+    body = (c - o).abs()
+    full_range = (h - l).clip(lower=1e-10)
+    feat['body_ratio'] = body / full_range
+    feat['upper_wick_ratio'] = (h - np.maximum(o, c)) / full_range
+    feat['lower_wick_ratio'] = (np.minimum(o, c) - l) / full_range
+    feat['candle_direction'] = np.sign(c - o)
+
+    direction = feat['candle_direction']
+    feat['consec_bullish'] = direction.rolling(6, min_periods=1).apply(
+        lambda x: (x > 0).sum(), raw=True)
+    feat['consec_bearish'] = direction.rolling(6, min_periods=1).apply(
+        lambda x: (x < 0).sum(), raw=True)
+
+    # ── FEATURE MOMENTUM (deltas of key microstructure features) ──
+    key_features = ['hurst_6h', 'vr_5', 'entropy_norm', 'order_imbalance',
+                    'kyle_lambda', 'jump_ratio', 'rv_yang_zhang']
+    for col in key_features:
+        if col in df_features.columns:
+            series = df_features[col]
+            feat[f'{col}_delta_3h'] = series.diff(3)
+            feat[f'{col}_delta_6h'] = series.diff(6)
+            feat[f'{col}_delta_12h'] = series.diff(12)
+
+    # ── VOLUME CONTEXT ──
+    feat['volume_ratio_6'] = v / v.rolling(6, min_periods=2).mean().clip(lower=1)
+    feat['volume_ratio_24'] = v / v.rolling(24, min_periods=6).mean().clip(lower=1)
+
+    # Convert to float32
+    for col in feat.columns:
+        feat[col] = feat[col].astype(np.float32)
+
+    return feat
+
+
+def compute_features_for_pair(pair, df_1m, df_5m, df_15m, df_1h=None):
+    """
+    Compute all features for one pair from OHLCV data.
+    Returns a DataFrame indexed by hour timestamps with 112 features
+    (64 microstructure + 48 contextual if df_1h is provided).
     """
     df_1m = df_1m.copy()
     df_1m['hour'] = df_1m.index.floor('h')
@@ -561,6 +657,11 @@ def compute_features_for_pair(pair, df_1m, df_5m, df_15m):
     df_features = pd.DataFrame(all_features).set_index('datetime').sort_index()
     df_features = compute_trailing_features(df_features, returns_1m_dict)
     df_features['pair'] = pair
+
+    # Add contextual features (features_6) if 1H data is available
+    if df_1h is not None and not df_1h.empty:
+        df_extra = compute_contextual_features(df_features, df_1h, pair)
+        df_features = df_features.join(df_extra, how='left')
 
     float_cols = df_features.select_dtypes(include=[np.float64]).columns
     df_features[float_cols] = df_features[float_cols].astype(np.float32)

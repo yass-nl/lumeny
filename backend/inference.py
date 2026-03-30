@@ -1,8 +1,9 @@
 """
-Model inference v5.1 — 3 LightGBM quantile models (Q25/Q50/Q75)
+Model inference v6.0 — 3 LightGBM quantile models (Q25/Q50/Q75)
 + 1 meta-model binary classifier for trade quality filtering.
 
 Direction = sign(Q50), trade quality = meta_proba.
+Two-path signal: meta path (P>0.50 + Q50>0.7x spread) OR high conviction bypass (Q50>1.0x spread).
 """
 
 import joblib
@@ -11,8 +12,9 @@ from pathlib import Path
 MODELS_DIR = Path("/app/models")
 
 AVG_SPREAD = 0.00028        # ~2.8 pips average spread
-MIN_Q50_THRESHOLD = AVG_SPREAD * 0.5   # 0.00014
-META_THRESHOLD = 0.55        # walk-forward optimal
+MIN_Q50_THRESHOLD = AVG_SPREAD * 0.7   # 0.000196
+META_THRESHOLD = 0.50
+HIGH_CONV_THRESHOLD = AVG_SPREAD * 1.0  # 0.00028 — bypass meta if Q50 exceeds this
 
 
 class Predictor:
@@ -95,9 +97,12 @@ class Predictor:
         X_meta = meta_row[self.meta_feature_cols].fillna(0)
         meta_proba = float(self.meta_model.predict_proba(X_meta)[0, 1])
 
-        # Trade signal: meta_proba above threshold AND |Q50| above minimum
-        # Strict > to match backtest exactly
-        is_tradeable = meta_proba > META_THRESHOLD and abs_q50 > MIN_Q50_THRESHOLD
+        # Two-path signal (matches simulation config exactly):
+        # Path 1 (meta): meta_proba > 0.50 AND |Q50| > 0.7x spread
+        # Path 2 (bypass): |Q50| > 1.0x spread — fires regardless of meta
+        meta_path = meta_proba > META_THRESHOLD and abs_q50 > MIN_Q50_THRESHOLD
+        high_conv_path = abs_q50 > HIGH_CONV_THRESHOLD
+        is_tradeable = meta_path or high_conv_path
 
         return {
             'pair': pair,
