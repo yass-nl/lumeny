@@ -1,15 +1,16 @@
 """
-Capital Simulation — Realistic P&L over 6 months
+Capital Simulation — 15-minute holding period variant
 
-Same pipeline as live backtest v5.2 (features, Q50, meta-model), but with:
-- $100,000 starting capital
-- 50:1 leverage everywhere (no prop firm restrictions)
-- Per-pair realistic spreads (from TradeLocker liquid-hours data)
-- 0.3 lots per trade, margin-aware sizing
-- Actual $ P&L per trade, equity curve, drawdown tracking
-- Spread filter: skip if spread > 30 points
+Model still predicts 1H moves (same features, same Q50/meta pipeline).
+We hold for only 15 minutes — capturing the initial directional impulse.
 
-Config: Meta P>0.55 + |Q50|>0.5x spread. 3H holding period.
+Key differences vs test_capital_sim_3.py:
+- Holding period: 15 minutes (exit = close of first 15m bar after entry)
+- Exit price: df_15m close at hour_ts + 1h (no future data leak)
+- Liquid hours only: skip hour 21 UTC, Friday >= 20:00 UTC, Sunday < 22:00 UTC
+- Meta threshold softened: P > 0.45 (more permissive to increase frequency)
+- Cooldown: 1h per pair (matches natural signal cadence — one signal per hour)
+- Q50 threshold: unchanged at 0.7x avg_spread
 """
 
 import os
@@ -223,19 +224,36 @@ def compute_slippage_cost_usd(pair, lots, exit_price, hour_utc=12, realized_vol=
 # ── Model thresholds (same as live) ──
 AVG_SPREAD = 0.00028
 MIN_Q50_THRESHOLD = AVG_SPREAD * 0.7
-META_THRESHOLD = 0.50
+META_THRESHOLD = 0.45
 
-BACKTEST_DAYS = 200   # ~6.5 months
+BACKTEST_DAYS = 200
 WARMUP_DAYS = 10
 TOTAL_FETCH_DAYS = BACKTEST_DAYS + WARMUP_DAYS
 DATE_OFFSET_DAYS = 0  # shift window back by N days (0 = current, 200 = previous 6 months)
+
+HOLDING_MINUTES = 15
+COOLDOWN_HOURS = 1
+
+# Liquid hours: skip 21 UTC (thin books), Friday >= 20 UTC, Sunday < 22 UTC
+def is_liquid_hour(dt):
+    dow = dt.dayofweek  # 0=Mon, 4=Fri, 6=Sun
+    h = dt.hour
+    if h == 21:
+        return False
+    if dow == 4 and h >= 20:  # Friday wind-down
+        return False
+    if dow == 6 and h < 22:   # Sunday pre-open
+        return False
+    return True
 
 print(f'Capital Simulation — Realistic P&L')
 print(f'  Starting capital: ${STARTING_CAPITAL:,.0f}')
 print(f'  Lot sizing: ATR-based (0.5% risk/trade) with per-pair capacity caps')
 print(f'  Max spread: {MAX_SPREAD_POINTS} points')
-print(f'  Meta threshold: {META_THRESHOLD}')
+print(f'  Meta threshold: {META_THRESHOLD} (softened from 0.50)')
 print(f'  Q50 threshold: {MIN_Q50_THRESHOLD}')
+print(f'  Holding period: {HOLDING_MINUTES} minutes')
+print(f'  Cooldown: {COOLDOWN_HOURS}h per pair')
 print(f'  Fetch window: {TOTAL_FETCH_DAYS} days (offset: {DATE_OFFSET_DAYS} days back)')
 
 
@@ -937,11 +955,19 @@ def compute_features_for_pair(pair, data):
     df_extra = compute_contextual_features(df_features, df_1h, pair)
     df_features = df_features.join(df_extra, how='left')
 
+    # Entry: close of the current 1h bar (last 1m close in the hour, known at bar close)
     close_1h = df_1h['close'].reindex(df_features.index, method='ffill')
-    close_1h_3 = df_1h['close'].shift(-3).reindex(df_features.index, method='ffill')
-    df_features['label_1H'] = np.log(close_1h_3 / close_1h)
+
+    # Exit: close of the first 15m bar that opens after entry (hour_ts + 1h).
+    # e.g. signal at 09:00 → entry at 09:59 close → exit at 10:14 close (the 10:00 bar in df_15m).
+    # Shift df_15m index back by 1h so it aligns with the signal hour index.
+    df_15m_exit = df_15m['close'].copy()
+    df_15m_exit.index = df_15m_exit.index - pd.Timedelta(hours=1)
+    exit_15m = df_15m_exit.reindex(df_features.index, method='ffill')
+
+    df_features['label_1H'] = np.log(exit_15m / close_1h)
     df_features['entry_price'] = close_1h
-    df_features['exit_price'] = close_1h_3
+    df_features['exit_price'] = exit_15m
 
     float_cols = df_features.select_dtypes(include=[np.float64]).columns
     df_features[float_cols] = df_features[float_cols].astype(np.float32)
@@ -1022,13 +1048,14 @@ def simulate_capital(df_all, backtest_start):
     df = df_all[df_all.index >= backtest_start].copy()
     df = df[df['label_1H'].notna()].copy()
 
-    # Dynamic config: meta P>0.5 + Q50>0.7x spread, OR bypass meta if Q50>1x spread
-    HIGH_CONV_THRESHOLD = AVG_SPREAD * 1.0
-    meta_path = (df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)
-    high_conv_path = df['abs_Q50'] > HIGH_CONV_THRESHOLD
-    df_signals = df[meta_path | high_conv_path].copy()
+    # Liquid hours only: no 21 UTC, no Friday wind-down, no Sunday pre-open
+    liquid_mask = pd.Series([is_liquid_hour(dt) for dt in df.index], index=df.index)
 
-    # Apply 3H cooldown per pair
+    # Signal filter: meta P > 0.45 + |Q50| > 0.7x spread (no high-conv bypass — spreads matter at 15min)
+    meta_path = (df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)
+    df_signals = df[meta_path & liquid_mask].copy()
+
+    # Apply 1H cooldown per pair (matches natural signal cadence)
     df_signals = df_signals.sort_index()
     pair_unlock_time = {}
     keep = []
@@ -1039,7 +1066,7 @@ def simulate_capital(df_all, backtest_start):
             keep.append(False)
         else:
             keep.append(True)
-            pair_unlock_time[pair] = idx + pd.Timedelta(hours=3)
+            pair_unlock_time[pair] = idx + pd.Timedelta(hours=COOLDOWN_HOURS)
     df_signals = df_signals[keep].copy()
 
     print(f'\n{"="*80}')
@@ -1106,7 +1133,7 @@ def simulate_capital(df_all, backtest_start):
             for _, sig in hour_signals.iterrows():
                 pair = sig['pair']
                 entry_price = sig['entry_price']
-                exit_price_2h = sig['exit_price']
+                exit_price_15m = sig['exit_price']
                 q50 = sig['Q50']
                 meta_p = sig['meta_proba']
                 direction = int(sig['pred_dir'])
@@ -1167,10 +1194,10 @@ def simulate_capital(df_all, backtest_start):
                     'direction': direction,
                     'lots': lots,
                     'entry_price': entry_price,
-                    'exit_price': exit_price_2h,
+                    'exit_price': exit_price_15m,
                     'margin_used': margin_needed,
                     'open_at': hour,
-                    'close_at': hour + pd.Timedelta(hours=3),
+                    'close_at': hour + pd.Timedelta(hours=1),  # closed at next hourly tick; exit_price is 15m close
                     'meta_proba': meta_p,
                     'q50': q50,
                     'realized_vol': ann_vol,

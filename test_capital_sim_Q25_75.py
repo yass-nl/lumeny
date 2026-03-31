@@ -1,15 +1,14 @@
 """
-Capital Simulation — Realistic P&L over 6 months
+Capital Simulation — Realistic P&L over 6 months (Q25/Q75 directional consensus variant)
 
-Same pipeline as live backtest v5.2 (features, Q50, meta-model), but with:
-- $100,000 starting capital
-- 50:1 leverage everywhere (no prop firm restrictions)
-- Per-pair realistic spreads (from TradeLocker liquid-hours data)
-- 0.3 lots per trade, margin-aware sizing
-- Actual $ P&L per trade, equity curve, drawdown tracking
-- Spread filter: skip if spread > 30 points
+Same pipeline as test_capital_sim_3.py, but meta model is REMOVED.
+Entry filter: all three quantiles must agree on direction + |Q50| > 0.7x avg_spread
+  - Long:  Q25 > 0 AND Q50 > 0 AND Q75 > 0
+  - Short: Q25 < 0 AND Q50 < 0 AND Q75 < 0
 
-Config: Meta P>0.55 + |Q50|>0.5x spread. 3H holding period.
+Rationale: meta model already uses Q25/Q75 as inputs (Q25_oof ranks 2nd in feature
+importance). This tests whether a hard quantile consensus rule beats meta's soft
+learned version of the same information.
 """
 
 import os
@@ -234,7 +233,7 @@ print(f'Capital Simulation — Realistic P&L')
 print(f'  Starting capital: ${STARTING_CAPITAL:,.0f}')
 print(f'  Lot sizing: ATR-based (0.5% risk/trade) with per-pair capacity caps')
 print(f'  Max spread: {MAX_SPREAD_POINTS} points')
-print(f'  Meta threshold: {META_THRESHOLD}')
+print(f'  Filter: Q25/Q75/Q50 consensus (no meta model)')
 print(f'  Q50 threshold: {MIN_Q50_THRESHOLD}')
 print(f'  Fetch window: {TOTAL_FETCH_DAYS} days (offset: {DATE_OFFSET_DAYS} days back)')
 
@@ -1022,11 +1021,13 @@ def simulate_capital(df_all, backtest_start):
     df = df_all[df_all.index >= backtest_start].copy()
     df = df[df['label_1H'].notna()].copy()
 
-    # Dynamic config: meta P>0.5 + Q50>0.7x spread, OR bypass meta if Q50>1x spread
-    HIGH_CONV_THRESHOLD = AVG_SPREAD * 1.0
-    meta_path = (df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)
-    high_conv_path = df['abs_Q50'] > HIGH_CONV_THRESHOLD
-    df_signals = df[meta_path | high_conv_path].copy()
+    # Q25/Q75 consensus: no meta model — trade only when all three quantiles agree on direction
+    # and |Q50| exceeds the minimum threshold
+    quantile_consensus = (
+        ((df['Q25'] > 0) & (df['Q50'] > 0) & (df['Q75'] > 0)) |
+        ((df['Q25'] < 0) & (df['Q50'] < 0) & (df['Q75'] < 0))
+    )
+    df_signals = df[quantile_consensus & (df['abs_Q50'] > MIN_Q50_THRESHOLD)].copy()
 
     # Apply 3H cooldown per pair
     df_signals = df_signals.sort_index()

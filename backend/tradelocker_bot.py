@@ -365,14 +365,7 @@ class TradeLockerBot:
                 )
                 break
 
-            # Use MAX_LOT_SIZE (0.3) if enough margin, otherwise scale down
-            # Estimate margin needed: 0.3 lots worst case ~$1,150 (EUR cross at 30:1)
-            # Scale: lot_size = min(MAX_LOT_SIZE, available_margin / estimated_margin_per_lot)
-            # Use conservative estimate: $3,800 per lot for crosses, $2,000 per lot for majors
-            est_margin_per_lot = 3800  # conservative: ~$1,140 for 0.3 lots cross
-            max_affordable = available_margin / est_margin_per_lot
-            lot_size = min(MAX_LOT_SIZE, round(max_affordable, 2))
-            lot_size = max(round(lot_size, 2), 0.01)  # minimum 0.01 lots
+            lot_size = MAX_LOT_SIZE
 
             side = 'buy' if direction == 'bullish' else 'sell'
 
@@ -396,14 +389,14 @@ class TradeLockerBot:
                         'instrument_id': instrument_id,
                     }
 
-                    # Deduct estimated margin so next iteration knows what's left
-                    available_margin -= lot_size * est_margin_per_lot
+                    # Re-fetch real margin from API so next iteration uses accurate value
+                    available_margin = await self._get_available_margin()
 
                     logger.info(
                         f'TradeLocker: {side.upper()} {lot_size} lots {pair} '
                         f'(meta={pred["meta_proba"]:.2f}, q50={pred["q50"]:.6f}) '
                         f'order_id={order_id}, close_at={matures_at.isoformat()}, '
-                        f'remaining_margin~${available_margin:.0f}'
+                        f'remaining_margin=${available_margin:.0f}'
                     )
 
             except Exception as e:

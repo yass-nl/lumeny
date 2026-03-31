@@ -1,15 +1,13 @@
 """
-Capital Simulation — Realistic P&L over 6 months
+Capital Simulation — SPREAD STRESS TEST
 
-Same pipeline as live backtest v5.2 (features, Q50, meta-model), but with:
-- $100,000 starting capital
-- 50:1 leverage everywhere (no prop firm restrictions)
-- Per-pair realistic spreads (from TradeLocker liquid-hours data)
-- 0.3 lots per trade, margin-aware sizing
-- Actual $ P&L per trade, equity curve, drawdown tracking
-- Spread filter: skip if spread > 30 points
+Runs 3 scenarios back to back to test edge fragility:
+  1. Baseline   — original off-hour multipliers (1.1-1.3x)
+  2. Stress 3x  — off-hour spread AND slippage multipliers × 3
+  3. Stress 5x  — off-hour spread AND slippage multipliers × 5
 
-Config: Meta P>0.55 + |Q50|>0.5x spread. 3H holding period.
+Key question: does the edge survive when 19-22 UTC spreads are realistically
+wider (3-5x liquid-hours baseline for thin crosses at NY close)?
 """
 
 import os
@@ -83,7 +81,7 @@ PIP_SIZE = {
 }
 
 # At 21:00-23:00 UTC — off-hours multipliers calibrated from Polygon (off-hours median / liquid median)
-OFFHOUR_SPREAD_MULTIPLIER = {
+OFFHOUR_SPREAD_MULTIPLIER_BASE = {
     # Majors
     'EURUSD': 1.1, 'GBPUSD': 1.1, 'USDJPY': 1.1, 'USDCHF': 1.2,
     'AUDUSD': 1.0, 'USDCAD': 0.9, 'NZDUSD': 1.0,
@@ -92,12 +90,32 @@ OFFHOUR_SPREAD_MULTIPLIER = {
     'AUDJPY': 1.1, 'CADJPY': 1.2, 'CHFJPY': 1.2, 'AUDNZD': 1.3,
 }
 
+# ── STRESS TEST CONFIG ──
+# Set this before running. 1.0 = baseline, 3.0 = 3x stress, 5.0 = 5x stress
+STRESS_MULTIPLIER = 1.0   # overridden at runtime per scenario
+
+# Effective multipliers — scaled by STRESS_MULTIPLIER at runtime
+OFFHOUR_SPREAD_MULTIPLIER = dict(OFFHOUR_SPREAD_MULTIPLIER_BASE)
+
+def apply_stress(stress_mult):
+    """Rebuild effective OFFHOUR_SPREAD_MULTIPLIER and SLIPPAGE_TIME_MULTIPLIER for the given stress level."""
+    global OFFHOUR_SPREAD_MULTIPLIER, SLIPPAGE_TIME_MULTIPLIER, STRESS_MULTIPLIER
+    STRESS_MULTIPLIER = stress_mult
+    OFFHOUR_SPREAD_MULTIPLIER = {k: v * stress_mult for k, v in OFFHOUR_SPREAD_MULTIPLIER_BASE.items()}
+    SLIPPAGE_TIME_MULTIPLIER_BASE = {
+        'EURUSD': 1.5, 'GBPUSD': 2.0, 'USDJPY': 2.0, 'USDCHF': 2.0,
+        'AUDUSD': 2.0, 'USDCAD': 2.0, 'NZDUSD': 2.0,
+        'EURJPY': 2.5, 'GBPJPY': 2.5, 'EURGBP': 2.0, 'EURAUD': 2.5,
+        'AUDJPY': 2.5, 'CADJPY': 2.5, 'CHFJPY': 3.0, 'AUDNZD': 2.5,
+    }
+    SLIPPAGE_TIME_MULTIPLIER = {k: v * stress_mult for k, v in SLIPPAGE_TIME_MULTIPLIER_BASE.items()}
+
 def get_spread_points(pair, hour_utc):
     """Get spread in points, adjusted for time of day."""
     base = SPREAD_POINTS.get(pair, 5)
     if hour_utc in (21, 22):
         mult = OFFHOUR_SPREAD_MULTIPLIER.get(pair, 2.0)
-        return int(base * mult)
+        return base * mult
     return base
 
 def spread_in_price(pair, hour_utc=12):
@@ -165,6 +183,7 @@ SLIPPAGE_BASE_POINTS = {
 }
 
 # Time multiplier: off-hours = thinner books = more slippage
+# Initialized at baseline — overridden by apply_stress() at runtime
 SLIPPAGE_TIME_MULTIPLIER = {
     'EURUSD': 1.5, 'GBPUSD': 2.0, 'USDJPY': 2.0, 'USDCHF': 2.0,
     'AUDUSD': 2.0, 'USDCAD': 2.0, 'NZDUSD': 2.0,
@@ -1351,7 +1370,34 @@ async def main():
     backtest_start = df_all.index.min() + pd.Timedelta(days=WARMUP_DAYS)
     print(f'Backtest starts: {backtest_start.date()} (after {WARMUP_DAYS} days warmup)')
 
-    df_trades, df_equity = simulate_capital(df_all, backtest_start)
+    # ── Run 3 stress scenarios ──
+    scenarios = [
+        (1.0, 'BASELINE   (off-hour spread × 1x)'),
+        (3.0, 'STRESS 3x  (off-hour spread × 3x)'),
+        (5.0, 'STRESS 5x  (off-hour spread × 5x)'),
+    ]
+
+    summary = []
+    for stress_mult, label in scenarios:
+        print(f'\n{"="*60}')
+        print(f'SCENARIO: {label}')
+        print(f'{"="*60}')
+        apply_stress(stress_mult)
+        df_trades, df_equity = simulate_capital(df_all, backtest_start)
+
+        if df_equity is not None and len(df_equity) > 0:
+            final_equity = df_equity['equity'].iloc[-1]
+            ret_pct = (final_equity - STARTING_CAPITAL) / STARTING_CAPITAL * 100
+            n_trades = len(df_trades) if df_trades is not None else 0
+            summary.append((label, ret_pct, n_trades, final_equity))
+
+    print(f'\n{"="*60}')
+    print(f'STRESS TEST SUMMARY')
+    print(f'{"="*60}')
+    print(f'{"Scenario":<40} {"Return":>10} {"Trades":>8} {"Final Equity":>15}')
+    print(f'{"-"*75}')
+    for label, ret_pct, n_trades, final_eq in summary:
+        print(f'{label:<40} {ret_pct:>+9.1f}% {n_trades:>8,}  ${final_eq:>13,.0f}')
 
     elapsed_total = time.time() - t_start
     print(f'\nTotal runtime: {elapsed_total:.0f}s')
