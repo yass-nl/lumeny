@@ -1,16 +1,14 @@
 """
-Capital Simulation — 15-minute holding period variant
+Paper Trading — Real Bid/Ask Spreads from Polygon (last 14 days)
 
-Model still predicts 1H moves (same features, same Q50/meta pipeline).
-We hold for only 15 minutes — capturing the initial directional impulse.
+Same pipeline as test_capital_sim_3.py but:
+- Only last 14 days of data
+- At each signal hour, fetches REAL bid/ask quotes from Polygon
+  around the entry timestamp to get the actual spread at trade time
+- Compares real spread vs hardcoded assumption
+- Reports EV per trade using real spread costs
 
-Key differences vs test_capital_sim_3.py:
-- Holding period: 15 minutes (exit = close of first 15m bar after entry)
-- Exit price: df_15m close at hour_ts + 1h (no future data leak)
-- Liquid hours only: skip hour 21 UTC, Friday >= 20:00 UTC, Sunday < 22:00 UTC
-- Meta threshold softened: P > 0.45 (more permissive to increase frequency)
-- Cooldown: 1h per pair (matches natural signal cadence — one signal per hour)
-- Q50 threshold: unchanged at 0.7x avg_spread
+Key output: did the edge survive real spreads?
 """
 
 import os
@@ -224,36 +222,19 @@ def compute_slippage_cost_usd(pair, lots, exit_price, hour_utc=12, realized_vol=
 # ── Model thresholds (same as live) ──
 AVG_SPREAD = 0.00028
 MIN_Q50_THRESHOLD = AVG_SPREAD * 0.7
-META_THRESHOLD = 0.45
+META_THRESHOLD = 0.50
 
-BACKTEST_DAYS = 200
+BACKTEST_DAYS = 14    # paper trading: last 2 weeks only
 WARMUP_DAYS = 10
 TOTAL_FETCH_DAYS = BACKTEST_DAYS + WARMUP_DAYS
-DATE_OFFSET_DAYS = 0  # shift window back by N days (0 = current, 200 = previous 6 months)
-
-HOLDING_MINUTES = 15
-COOLDOWN_HOURS = 1
-
-# Liquid hours: skip 21 UTC (thin books), Friday >= 20 UTC, Sunday < 22 UTC
-def is_liquid_hour(dt):
-    dow = dt.dayofweek  # 0=Mon, 4=Fri, 6=Sun
-    h = dt.hour
-    if h == 21:
-        return False
-    if dow == 4 and h >= 20:  # Friday wind-down
-        return False
-    if dow == 6 and h < 22:   # Sunday pre-open
-        return False
-    return True
+DATE_OFFSET_DAYS = 0
 
 print(f'Capital Simulation — Realistic P&L')
 print(f'  Starting capital: ${STARTING_CAPITAL:,.0f}')
 print(f'  Lot sizing: ATR-based (0.5% risk/trade) with per-pair capacity caps')
 print(f'  Max spread: {MAX_SPREAD_POINTS} points')
-print(f'  Meta threshold: {META_THRESHOLD} (softened from 0.50)')
+print(f'  Meta threshold: {META_THRESHOLD}')
 print(f'  Q50 threshold: {MIN_Q50_THRESHOLD}')
-print(f'  Holding period: {HOLDING_MINUTES} minutes')
-print(f'  Cooldown: {COOLDOWN_HOURS}h per pair')
 print(f'  Fetch window: {TOTAL_FETCH_DAYS} days (offset: {DATE_OFFSET_DAYS} days back)')
 
 
@@ -955,19 +936,11 @@ def compute_features_for_pair(pair, data):
     df_extra = compute_contextual_features(df_features, df_1h, pair)
     df_features = df_features.join(df_extra, how='left')
 
-    # Entry: close of the current 1h bar (last 1m close in the hour, known at bar close)
     close_1h = df_1h['close'].reindex(df_features.index, method='ffill')
-
-    # Exit: close of the first 15m bar that opens after entry (hour_ts + 1h).
-    # e.g. signal at 09:00 → entry at 09:59 close → exit at 10:14 close (the 10:00 bar in df_15m).
-    # Shift df_15m index back by 1h so it aligns with the signal hour index.
-    df_15m_exit = df_15m['close'].copy()
-    df_15m_exit.index = df_15m_exit.index - pd.Timedelta(hours=1)
-    exit_15m = df_15m_exit.reindex(df_features.index, method='ffill')
-
-    df_features['label_1H'] = np.log(exit_15m / close_1h)
+    close_1h_3 = df_1h['close'].shift(-3).reindex(df_features.index, method='ffill')
+    df_features['label_1H'] = np.log(close_1h_3 / close_1h)
     df_features['entry_price'] = close_1h
-    df_features['exit_price'] = exit_15m
+    df_features['exit_price'] = close_1h_3
 
     float_cols = df_features.select_dtypes(include=[np.float64]).columns
     df_features[float_cols] = df_features[float_cols].astype(np.float32)
@@ -1048,14 +1021,13 @@ def simulate_capital(df_all, backtest_start):
     df = df_all[df_all.index >= backtest_start].copy()
     df = df[df['label_1H'].notna()].copy()
 
-    # Liquid hours only: no 21 UTC, no Friday wind-down, no Sunday pre-open
-    liquid_mask = pd.Series([is_liquid_hour(dt) for dt in df.index], index=df.index)
-
-    # Signal filter: meta P > 0.45 + |Q50| > 0.7x spread (no high-conv bypass — spreads matter at 15min)
+    # Dynamic config: meta P>0.5 + Q50>0.7x spread, OR bypass meta if Q50>1x spread
+    HIGH_CONV_THRESHOLD = AVG_SPREAD * 1.0
     meta_path = (df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)
-    df_signals = df[meta_path & liquid_mask].copy()
+    high_conv_path = df['abs_Q50'] > HIGH_CONV_THRESHOLD
+    df_signals = df[meta_path | high_conv_path].copy()
 
-    # Apply 1H cooldown per pair (matches natural signal cadence)
+    # Apply 3H cooldown per pair
     df_signals = df_signals.sort_index()
     pair_unlock_time = {}
     keep = []
@@ -1066,7 +1038,7 @@ def simulate_capital(df_all, backtest_start):
             keep.append(False)
         else:
             keep.append(True)
-            pair_unlock_time[pair] = idx + pd.Timedelta(hours=COOLDOWN_HOURS)
+            pair_unlock_time[pair] = idx + pd.Timedelta(hours=3)
     df_signals = df_signals[keep].copy()
 
     print(f'\n{"="*80}')
@@ -1133,7 +1105,7 @@ def simulate_capital(df_all, backtest_start):
             for _, sig in hour_signals.iterrows():
                 pair = sig['pair']
                 entry_price = sig['entry_price']
-                exit_price_15m = sig['exit_price']
+                exit_price_2h = sig['exit_price']
                 q50 = sig['Q50']
                 meta_p = sig['meta_proba']
                 direction = int(sig['pred_dir'])
@@ -1194,10 +1166,10 @@ def simulate_capital(df_all, backtest_start):
                     'direction': direction,
                     'lots': lots,
                     'entry_price': entry_price,
-                    'exit_price': exit_price_15m,
+                    'exit_price': exit_price_2h,
                     'margin_used': margin_needed,
                     'open_at': hour,
-                    'close_at': hour + pd.Timedelta(hours=1),  # closed at next hourly tick; exit_price is 15m close
+                    'close_at': hour + pd.Timedelta(hours=3),
                     'meta_proba': meta_p,
                     'q50': q50,
                     'realized_vol': ann_vol,
@@ -1352,6 +1324,81 @@ def simulate_capital(df_all, backtest_start):
 # ──────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────
+async def fetch_real_spread(pair: str, signal_dt: datetime, n_quotes: int = 100) -> dict:
+    """
+    Fetch real bid/ask quotes from Polygon around signal_dt.
+    Returns median spread, min spread, max spread at that timestamp.
+    signal_dt is the hourly bar close = entry time.
+    We fetch quotes in a 60-second window ending at signal_dt.
+    """
+    ticker = f'C:{pair}'
+    # 60-second window ending at signal timestamp
+    ts_start = int(signal_dt.timestamp() * 1e9)
+    ts_end   = int((signal_dt + timedelta(seconds=60)).timestamp() * 1e9)
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f'{REST_BASE}/v3/quotes/{ticker}',
+                params={
+                    'apiKey':              API_KEY,
+                    'timestamp.gte':       ts_start,
+                    'timestamp.lte':       ts_end,
+                    'limit':               n_quotes,
+                    'sort':                'timestamp',
+                    'order':               'desc',
+                }
+            )
+            if r.status_code != 200:
+                return None
+            results = r.json().get('results', [])
+            if not results:
+                return None
+
+            spreads = [q['ask_price'] - q['bid_price'] for q in results
+                       if q.get('ask_price') and q.get('bid_price') and q['ask_price'] > q['bid_price']]
+            if not spreads:
+                return None
+
+            mid_prices = [(q['ask_price'] + q['bid_price']) / 2 for q in results
+                          if q.get('ask_price') and q.get('bid_price')]
+
+            return {
+                'spread_median': float(np.median(spreads)),
+                'spread_mean':   float(np.mean(spreads)),
+                'spread_min':    float(np.min(spreads)),
+                'spread_max':    float(np.max(spreads)),
+                'spread_p75':    float(np.percentile(spreads, 75)),
+                'mid_price':     float(np.mean(mid_prices)) if mid_prices else None,
+                'n_quotes':      len(spreads),
+            }
+    except Exception:
+        return None
+
+
+async def fetch_spreads_for_signals(signals: list) -> dict:
+    """
+    Fetch real spreads for all signals concurrently (batched to avoid rate limits).
+    signals: list of (pair, datetime) tuples
+    Returns dict keyed by (pair, datetime) -> spread info
+    """
+    results = {}
+    BATCH_SIZE = 20  # concurrent requests per batch
+
+    print(f'\nFetching real bid/ask spreads for {len(signals)} signals...')
+    for i in range(0, len(signals), BATCH_SIZE):
+        batch = signals[i:i + BATCH_SIZE]
+        tasks = [fetch_real_spread(pair, dt) for pair, dt in batch]
+        batch_results = await asyncio.gather(*tasks)
+        for (pair, dt), res in zip(batch, batch_results):
+            results[(pair, dt)] = res
+        print(f'  {min(i + BATCH_SIZE, len(signals))}/{len(signals)} done', end='\r')
+        await asyncio.sleep(0.3)  # gentle rate limiting
+
+    print(f'  Done. Got spreads for {sum(1 for v in results.values() if v is not None)}/{len(signals)} signals.')
+    return results
+
+
 async def main():
     t_start = time.time()
 
@@ -1378,7 +1425,205 @@ async def main():
     backtest_start = df_all.index.min() + pd.Timedelta(days=WARMUP_DAYS)
     print(f'Backtest starts: {backtest_start.date()} (after {WARMUP_DAYS} days warmup)')
 
-    df_trades, df_equity = simulate_capital(df_all, backtest_start)
+    # ── Get signals (meta-accepted rows after warmup) ──
+    signal_mask = (
+        (df_all.index >= backtest_start) &
+        (df_all['abs_Q50'] > MIN_Q50_THRESHOLD) &
+        (df_all['meta_proba'] > META_THRESHOLD)
+    )
+    df_signals = df_all[signal_mask].copy()
+    signal_list = [(row['pair'], idx) for idx, row in df_signals.iterrows()]
+    print(f'Signals to evaluate: {len(signal_list)}')
+
+    # ── Fetch real spreads from Polygon ──
+    real_spreads = await fetch_spreads_for_signals(signal_list)
+
+    # ── Build results ──
+    rows = []
+    for idx, row in df_signals.iterrows():
+        pair     = row['pair']
+        hour_utc = idx.hour
+        assumed  = spread_in_price(pair, hour_utc)  # hardcoded assumption
+
+        real = real_spreads.get((pair, idx))
+        real_spread = real['spread_median'] if real else None
+        real_p75    = real['spread_p75']    if real else None
+        n_quotes    = real['n_quotes']      if real else 0
+
+        actual_return = row.get('label_1H', np.nan)
+        pred_dir      = row['pred_dir']
+        gross_pnl     = pred_dir * actual_return if not np.isnan(actual_return) else np.nan
+
+        rows.append({
+            'datetime':       idx,
+            'pair':           pair,
+            'hour':           hour_utc,
+            'pred_dir':       pred_dir,
+            'Q50':            row['Q50'],
+            'meta_proba':     row['meta_proba'],
+            'actual_return':  actual_return,
+            'gross_pnl':      gross_pnl,
+            'assumed_spread': assumed,
+            'real_spread':    real_spread,
+            'real_p75':       real_p75,
+            'n_quotes':       n_quotes,
+            'spread_ratio':   (real_spread / assumed) if real_spread and assumed > 0 else None,
+            'net_pnl_assumed': gross_pnl - assumed    if not np.isnan(actual_return) else np.nan,
+            'net_pnl_real':    gross_pnl - real_spread if (real_spread and not np.isnan(actual_return)) else np.nan,
+        })
+
+    df_results = pd.DataFrame(rows)
+
+    # ── REPORT ──
+    print(f'\n{"="*70}')
+    print(f'PAPER TRADING — REAL SPREAD ANALYSIS')
+    print(f'{"="*70}')
+    print(f'Period:  {backtest_start.date()} to {df_all.index.max().date()}')
+    print(f'Signals: {len(df_results)}')
+
+    has_real = df_results['real_spread'].notna()
+    print(f'Real spread data: {has_real.sum()}/{len(df_results)} signals ({has_real.mean():.0%})')
+
+    # Overall spread comparison
+    print(f'\n--- Spread Comparison (assumed vs real) ---')
+    s = df_results[has_real]
+    print(f'{"":20} {"Assumed":>12} {"Real median":>12} {"Real P75":>12} {"Ratio":>8}')
+    print('-' * 68)
+    print(f'{"ALL signals":<20} {s["assumed_spread"].mean():>12.6f} {s["real_spread"].mean():>12.6f} {s["real_p75"].mean():>12.6f} {s["spread_ratio"].mean():>8.2f}x')
+
+    for hour in sorted(s['hour'].unique()):
+        h = s[s['hour'] == hour]
+        if len(h) < 3:
+            continue
+        flag = ' <-- KEY' if hour in (19, 20, 21, 22) else ''
+        print(f'  Hour {hour:02d}:{" "*13} {h["assumed_spread"].mean():>12.6f} {h["real_spread"].mean():>12.6f} {h["real_p75"].mean():>12.6f} {h["spread_ratio"].mean():>8.2f}x{flag}')
+
+    # Per-pair spread comparison
+    print(f'\n--- Per-Pair Spread Comparison ---')
+    print(f'{"Pair":<10} {"Signals":>8} {"Assumed":>12} {"Real median":>12} {"Real P75":>12} {"Ratio":>8}')
+    print('-' * 60)
+    for pair in sorted(s['pair'].unique()):
+        p = s[s['pair'] == pair]
+        print(f'{pair:<10} {len(p):>8} {p["assumed_spread"].mean():>12.6f} {p["real_spread"].mean():>12.6f} {p["real_p75"].mean():>12.6f} {p["spread_ratio"].mean():>8.2f}x')
+
+    # EV with assumed vs real spreads
+    has_return = df_results['actual_return'].notna() & has_real
+    ev = df_results[has_return]
+    correct = (ev['pred_dir'] == np.sign(ev['actual_return'])).mean()
+
+    print(f'\n--- EV Analysis (signals with actual returns) ---')
+    print(f'Signals with returns: {has_return.sum()}')
+    print(f'Win rate: {correct:.1%}')
+    print(f'Gross PnL/trade:          {ev["gross_pnl"].mean():>10.6f}')
+    print(f'Net PnL/trade (assumed):  {ev["net_pnl_assumed"].mean():>10.6f}  total={ev["net_pnl_assumed"].sum():.4f}')
+    print(f'Net PnL/trade (real):     {ev["net_pnl_real"].mean():>10.6f}  total={ev["net_pnl_real"].sum():.4f}')
+    print(f'Net PnL/trade (real P75): {(ev["gross_pnl"] - ev["real_p75"]).mean():>10.6f}')
+
+    # Hours 19-22 deep dive
+    print(f'\n--- Hours 19-22 Deep Dive ---')
+    print(f'{"Hour":<6} {"N":>5} {"WR":>7} {"Gross":>10} {"Net(assumed)":>14} {"Net(real)":>12} {"Ratio":>8}')
+    print('-' * 65)
+    for hour in [19, 20, 21, 22]:
+        h = ev[ev['hour'] == hour]
+        if len(h) == 0:
+            continue
+        wr  = (h['pred_dir'] == np.sign(h['actual_return'])).mean()
+        print(f'{hour:<6} {len(h):>5} {wr:>6.1%} {h["gross_pnl"].mean():>10.6f} '
+              f'{h["net_pnl_assumed"].mean():>14.6f} {h["net_pnl_real"].mean():>12.6f} '
+              f'{h["spread_ratio"].mean():>8.2f}x')
+
+    # Worst spread cases
+    print(f'\n--- Top 10 Worst Real Spreads (vs assumption) ---')
+    worst = s.nlargest(10, 'spread_ratio')[['datetime','pair','hour','assumed_spread','real_spread','spread_ratio','meta_proba','Q50']]
+    print(worst.to_string(index=False))
+
+    # ── SPREAD PROFILE: every hour 19-00, every pair, every day ──
+    # Build list of (pair, datetime) for each hour in 19-23 + 00
+    # Sample: one timestamp per hour per pair per day (at HH:59 = end of bar)
+    print(f'\n{"="*70}')
+    print(f'SPREAD PROFILE — Hours 19:00 to 00:00 (all days, all pairs)')
+    print(f'{"="*70}')
+
+    profile_hours = [19, 20, 21, 22, 23, 0]
+    backtest_dates = pd.date_range(backtest_start.date(), df_all.index.max().date(), freq='D')
+    profile_samples = []
+    for day in backtest_dates:
+        dow = day.dayofweek
+        if dow == 5:  # Saturday — skip
+            continue
+        for h in profile_hours:
+            # Skip Sunday before 21:00
+            if dow == 6 and h < 21:
+                continue
+            # Use HH:59 as sample point (end of hour bar)
+            if h == 0:
+                sample_dt = datetime(day.year, day.month, day.day, 0, 1)
+            else:
+                sample_dt = datetime(day.year, day.month, day.day, h, 1)
+            for pair in PAIRS:
+                profile_samples.append((pair, sample_dt, h))
+
+    # Deduplicate and fetch
+    unique_samples = list({(p, dt): (p, dt, h) for p, dt, h in profile_samples}.values())
+    print(f'Sampling {len(unique_samples)} timestamps ({len(backtest_dates)} days × {len(profile_hours)} hours × {len(PAIRS)} pairs)...')
+
+    profile_results = {}
+    BATCH_SIZE = 20
+    for i in range(0, len(unique_samples), BATCH_SIZE):
+        batch = unique_samples[i:i + BATCH_SIZE]
+        tasks = [fetch_real_spread(pair, dt) for pair, dt, h in batch]
+        batch_res = await asyncio.gather(*tasks)
+        for (pair, dt, h), res in zip(batch, batch_res):
+            profile_results[(pair, dt, h)] = res
+        print(f'  {min(i + BATCH_SIZE, len(unique_samples))}/{len(unique_samples)}', end='\r')
+        await asyncio.sleep(0.3)
+    print(f'  Done.')
+
+    # Build profile dataframe
+    prof_rows = []
+    for (pair, dt, h), res in profile_results.items():
+        if res is None:
+            continue
+        prof_rows.append({
+            'pair':           pair,
+            'hour':           h,
+            'datetime':       dt,
+            'real_spread':    res['spread_median'],
+            'real_p75':       res['spread_p75'],
+            'assumed_spread': spread_in_price(pair, h),
+            'n_quotes':       res['n_quotes'],
+        })
+    df_prof = pd.DataFrame(prof_rows)
+    df_prof['ratio'] = df_prof['real_spread'] / df_prof['assumed_spread'].clip(lower=1e-10)
+
+    # Per-hour summary across all pairs
+    print(f'\n--- Spread Ratio by Hour (median across all pairs & days) ---')
+    print(f'{"Hour":<6} {"Samples":>8} {"Assumed(avg)":>14} {"Real median":>12} {"Real P75":>10} {"Ratio":>8}')
+    print('-' * 65)
+    for h in profile_hours:
+        hd = df_prof[df_prof['hour'] == h]
+        if len(hd) == 0:
+            continue
+        flag = ' <<<' if hd['ratio'].median() > 2.0 else ''
+        print(f'{h:02d}:00  {len(hd):>8} {hd["assumed_spread"].mean():>14.6f} '
+              f'{hd["real_spread"].median():>12.6f} {hd["real_p75"].median():>10.6f} '
+              f'{hd["ratio"].median():>8.2f}x{flag}')
+
+    # Per-pair per-hour heatmap
+    print(f'\n--- Spread Ratio Heatmap: Pair × Hour ---')
+    header = f'{"Pair":<10}' + ''.join(f'  {h:02d}:00' for h in profile_hours)
+    print(header)
+    print('-' * (10 + 8 * len(profile_hours)))
+    for pair in sorted(PAIRS):
+        row = f'{pair:<10}'
+        for h in profile_hours:
+            cell = df_prof[(df_prof['pair'] == pair) & (df_prof['hour'] == h)]
+            if len(cell) == 0:
+                row += f'{"  N/A":>8}'
+            else:
+                ratio = cell['ratio'].median()
+                row += f'  {ratio:>5.1f}x'
+        print(row)
 
     elapsed_total = time.time() - t_start
     print(f'\nTotal runtime: {elapsed_total:.0f}s')

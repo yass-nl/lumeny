@@ -1,13 +1,13 @@
 """
-Capital Simulation — SPREAD STRESS TEST
+Capital Simulation v4 — MFE Q50 Model + Dedicated Direction Model, TP/SL
 
-Runs 3 scenarios back to back to test edge fragility:
-  1. Baseline   — original off-hour multipliers (1.1-1.3x)
-  2. Stress 3x  — off-hour spread AND slippage multipliers × 3
-  3. Stress 5x  — off-hour spread AND slippage multipliers × 5
-
-Key question: does the edge survive when 19-22 UTC spreads are realistically
-wider (3-5x liquid-hours baseline for thin crosses at NY close)?
+Strategy:
+- Gate: MFE Q50 > MFE_THRESHOLD (predicted max move > X pips)
+- Direction: dedicated binary direction model (trained on MFE>70 population)
+- Direction filter: only trade when prob_long > DIR_THRESHOLD or < (1-DIR_THRESHOLD)
+- Exit: TP=50 pips / SL=25 pips / max 72H hold
+- Sizing: ATR-based, 2% risk per trade, per-pair capacity caps
+- Model: features_9 MFE Q50 model + direction model (models_9/direction)
 """
 
 import os
@@ -34,19 +34,19 @@ REST_BASE = 'https://api.polygon.io'
 PAIRS = [
     # Majors
     'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
-    # Liquid crosses only
-    'EURJPY', 'GBPJPY', 'EURGBP',
+    # Crosses
+    'EURJPY', 'GBPJPY', 'EURGBP', 'EURAUD', 'AUDJPY', 'CADJPY', 'CHFJPY', 'AUDNZD',
 ]
 
-MODELS_DIR = Path('backend/models_6/3_quants')
-META_DIR   = Path('backend/models_6/meta')
+MODELS_DIR     = Path('backend/models_9/mfe_q50')
+DIR_MODELS_DIR = Path('backend/models_9/direction')
 
 # ── Capital simulation parameters ──
 STARTING_CAPITAL = 1_000_000.0
 LOT_UNITS = 100_000       # 1 standard lot = 100,000 units
 MIN_MARGIN_TO_TRADE = 4_000
 MAX_SPREAD_POINTS = 50
-RISK_PER_TRADE = 0.005    # 0.5% of equity per trade
+RISK_PER_TRADE = 0.02     # 2% of equity per trade
 
 # Market capacity caps (lots) — from BIS 2022 analysis, 50% of 1% hourly volume / 4 simultaneous
 # Binding constraint is always the illiquid crosses
@@ -81,7 +81,7 @@ PIP_SIZE = {
 }
 
 # At 21:00-23:00 UTC — off-hours multipliers calibrated from Polygon (off-hours median / liquid median)
-OFFHOUR_SPREAD_MULTIPLIER_BASE = {
+OFFHOUR_SPREAD_MULTIPLIER = {
     # Majors
     'EURUSD': 1.1, 'GBPUSD': 1.1, 'USDJPY': 1.1, 'USDCHF': 1.2,
     'AUDUSD': 1.0, 'USDCAD': 0.9, 'NZDUSD': 1.0,
@@ -90,32 +90,12 @@ OFFHOUR_SPREAD_MULTIPLIER_BASE = {
     'AUDJPY': 1.1, 'CADJPY': 1.2, 'CHFJPY': 1.2, 'AUDNZD': 1.3,
 }
 
-# ── STRESS TEST CONFIG ──
-# Set this before running. 1.0 = baseline, 3.0 = 3x stress, 5.0 = 5x stress
-STRESS_MULTIPLIER = 1.0   # overridden at runtime per scenario
-
-# Effective multipliers — scaled by STRESS_MULTIPLIER at runtime
-OFFHOUR_SPREAD_MULTIPLIER = dict(OFFHOUR_SPREAD_MULTIPLIER_BASE)
-
-def apply_stress(stress_mult):
-    """Rebuild effective OFFHOUR_SPREAD_MULTIPLIER and SLIPPAGE_TIME_MULTIPLIER for the given stress level."""
-    global OFFHOUR_SPREAD_MULTIPLIER, SLIPPAGE_TIME_MULTIPLIER, STRESS_MULTIPLIER
-    STRESS_MULTIPLIER = stress_mult
-    OFFHOUR_SPREAD_MULTIPLIER = {k: v * stress_mult for k, v in OFFHOUR_SPREAD_MULTIPLIER_BASE.items()}
-    SLIPPAGE_TIME_MULTIPLIER_BASE = {
-        'EURUSD': 1.5, 'GBPUSD': 2.0, 'USDJPY': 2.0, 'USDCHF': 2.0,
-        'AUDUSD': 2.0, 'USDCAD': 2.0, 'NZDUSD': 2.0,
-        'EURJPY': 2.5, 'GBPJPY': 2.5, 'EURGBP': 2.0, 'EURAUD': 2.5,
-        'AUDJPY': 2.5, 'CADJPY': 2.5, 'CHFJPY': 3.0, 'AUDNZD': 2.5,
-    }
-    SLIPPAGE_TIME_MULTIPLIER = {k: v * stress_mult for k, v in SLIPPAGE_TIME_MULTIPLIER_BASE.items()}
-
 def get_spread_points(pair, hour_utc):
     """Get spread in points, adjusted for time of day."""
     base = SPREAD_POINTS.get(pair, 5)
     if hour_utc in (21, 22):
         mult = OFFHOUR_SPREAD_MULTIPLIER.get(pair, 2.0)
-        return base * mult
+        return int(base * mult)
     return base
 
 def spread_in_price(pair, hour_utc=12):
@@ -183,7 +163,6 @@ SLIPPAGE_BASE_POINTS = {
 }
 
 # Time multiplier: off-hours = thinner books = more slippage
-# Initialized at baseline — overridden by apply_stress() at runtime
 SLIPPAGE_TIME_MULTIPLIER = {
     'EURUSD': 1.5, 'GBPUSD': 2.0, 'USDJPY': 2.0, 'USDCHF': 2.0,
     'AUDUSD': 2.0, 'USDCAD': 2.0, 'NZDUSD': 2.0,
@@ -239,22 +218,19 @@ def compute_slippage_cost_usd(pair, lots, exit_price, hour_utc=12, realized_vol=
         return lots * LOT_UNITS * sp * rate
 
 
-# ── Model thresholds (same as live) ──
-AVG_SPREAD = 0.00028
-MIN_Q50_THRESHOLD = AVG_SPREAD * 0.7
-META_THRESHOLD = 0.50
+# ── Model thresholds ──
+MFE_THRESHOLD = 70.0   # pips — only trade bars where model predicts MFE > 70 pips
+DIR_THRESHOLD = 0.55   # direction confidence — only trade when prob_long > 0.55 or < 0.45
 
 BACKTEST_DAYS = 200   # ~6.5 months
 WARMUP_DAYS = 10
 TOTAL_FETCH_DAYS = BACKTEST_DAYS + WARMUP_DAYS
 DATE_OFFSET_DAYS = 0  # shift window back by N days (0 = current, 200 = previous 6 months)
 
-print(f'Capital Simulation — Realistic P&L')
+print(f'Capital Simulation v4 — MFE Q50 + Direction Model')
 print(f'  Starting capital: ${STARTING_CAPITAL:,.0f}')
-print(f'  Lot sizing: ATR-based (0.5% risk/trade) with per-pair capacity caps')
-print(f'  Max spread: {MAX_SPREAD_POINTS} points')
-print(f'  Meta threshold: {META_THRESHOLD}')
-print(f'  Q50 threshold: {MIN_Q50_THRESHOLD}')
+print(f'  MFE threshold: {MFE_THRESHOLD} pips')
+print(f'  Direction threshold: {DIR_THRESHOLD} (only trades with prob_long > {DIR_THRESHOLD} or < {1-DIR_THRESHOLD})')
 print(f'  Fetch window: {TOTAL_FETCH_DAYS} days (offset: {DATE_OFFSET_DAYS} days back)')
 
 
@@ -824,15 +800,46 @@ def compute_trailing_features(df_hourly, returns_1m_dict):
     return df_hourly
 
 
-def compute_contextual_features(df_features, df_1h, pair):
-    """Compute features_6 contextual features on top of microstructure features.
+# Cross-pair peer map (mirrors build_nb8_01.py CROSS_PEERS)
+CROSS_PEERS = {
+    'EURUSD': ['GBPUSD', 'AUDUSD', 'EURGBP', 'EURJPY'],
+    'GBPUSD': ['EURUSD', 'AUDUSD', 'EURGBP', 'GBPJPY'],
+    'USDJPY': ['EURJPY', 'GBPJPY', 'AUDJPY', 'CADJPY'],
+    'USDCHF': ['EURUSD', 'GBPUSD', 'CHFJPY'],
+    'AUDUSD': ['EURUSD', 'GBPUSD', 'NZDUSD', 'AUDNZD', 'AUDJPY'],
+    'USDCAD': ['CADJPY', 'EURUSD', 'GBPUSD'],
+    'NZDUSD': ['AUDUSD', 'AUDNZD', 'EURUSD'],
+    'EURJPY': ['USDJPY', 'GBPJPY', 'AUDJPY', 'EURUSD'],
+    'GBPJPY': ['USDJPY', 'EURJPY', 'AUDJPY', 'GBPUSD'],
+    'EURGBP': ['EURUSD', 'GBPUSD', 'EURJPY'],
+    'EURAUD': ['EURUSD', 'AUDUSD', 'AUDNZD'],
+    'AUDJPY': ['USDJPY', 'EURJPY', 'AUDUSD', 'AUDNZD'],
+    'CADJPY': ['USDJPY', 'EURJPY', 'USDCAD'],
+    'CHFJPY': ['USDJPY', 'EURJPY', 'USDCHF'],
+    'AUDNZD': ['AUDUSD', 'NZDUSD', 'AUDJPY'],
+}
 
-    Mirrors exactly: notebooks_6/01_big_move_detection.ipynb → compute_extra_features()
+# Currency composition for CSI (mirrors build_nb8_01.py CURRENCY_SIGN)
+CURRENCY_SIGN = {
+    'EURUSD': {'EUR': +1, 'USD': -1}, 'GBPUSD': {'GBP': +1, 'USD': -1},
+    'USDJPY': {'USD': +1, 'JPY': -1}, 'USDCHF': {'USD': +1, 'CHF': -1},
+    'AUDUSD': {'AUD': +1, 'USD': -1}, 'USDCAD': {'USD': +1, 'CAD': -1},
+    'NZDUSD': {'NZD': +1, 'USD': -1}, 'EURJPY': {'EUR': +1, 'JPY': -1},
+    'GBPJPY': {'GBP': +1, 'JPY': -1}, 'EURGBP': {'EUR': +1, 'GBP': -1},
+    'EURAUD': {'EUR': +1, 'AUD': -1}, 'AUDJPY': {'AUD': +1, 'JPY': -1},
+    'CADJPY': {'CAD': +1, 'JPY': -1}, 'CHFJPY': {'CHF': +1, 'JPY': -1},
+    'AUDNZD': {'AUD': +1, 'NZD': -1},
+}
+CURRENCIES = ['EUR', 'USD', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD', 'CHF']
+
+
+def compute_contextual_features(df_features, df_1h, pair):
+    """Layer 2: ATR, range, sessions, candle structure, deltas, volume.
+    Mirrors notebooks_6/01_big_move_detection.ipynb → compute_extra_features()
     """
     pip = PIP_SIZE.get(pair, 0.0001)
     feat = pd.DataFrame(index=df_features.index)
 
-    # Align 1H OHLCV to feature index
     df_1h = df_1h.reindex(df_features.index)
     o = df_1h['open']
     h = df_1h['high']
@@ -840,110 +847,226 @@ def compute_contextual_features(df_features, df_1h, pair):
     c = df_1h['close']
     v = df_1h['volume']
 
-    # ── ATR CONTEXT ──
+    # ATR context
     tr = np.maximum(h - l, np.maximum(np.abs(h - c.shift(1)), np.abs(l - c.shift(1))))
-    feat['atr_6'] = tr.rolling(6, min_periods=3).mean() / pip
-    feat['atr_24'] = tr.rolling(24, min_periods=6).mean() / pip
+    feat['atr_6']  = tr.rolling(6,  min_periods=3).mean()  / pip
+    feat['atr_24'] = tr.rolling(24, min_periods=6).mean()  / pip
     feat['atr_72'] = tr.rolling(72, min_periods=24).mean() / pip
     feat['atr_ratio_6_24'] = feat['atr_6'] / feat['atr_24'].clip(lower=1e-10)
     feat['atr_ratio_6_72'] = feat['atr_6'] / feat['atr_72'].clip(lower=1e-10)
 
-    # ── RANGE POSITION ──
+    # Range position (24H, 48H)
     high_24 = h.rolling(24, min_periods=6).max()
-    low_24 = l.rolling(24, min_periods=6).min()
+    low_24  = l.rolling(24, min_periods=6).min()
     range_24 = high_24 - low_24
-    feat['range_pos_24'] = (c - low_24) / range_24.clip(lower=1e-10)
+    feat['range_pos_24']   = (c - low_24)  / range_24.clip(lower=1e-10)
     feat['range_width_24'] = range_24 / pip
 
     high_48 = h.rolling(48, min_periods=12).max()
-    low_48 = l.rolling(48, min_periods=12).min()
+    low_48  = l.rolling(48, min_periods=12).min()
     range_48 = high_48 - low_48
-    feat['range_pos_48'] = (c - low_48) / range_48.clip(lower=1e-10)
+    feat['range_pos_48']   = (c - low_48)  / range_48.clip(lower=1e-10)
     feat['range_width_48'] = range_48 / pip
 
     atr_price = tr.rolling(24, min_periods=6).mean()
     feat['dist_from_24h_high'] = (high_24 - c) / atr_price.clip(lower=1e-10)
-    feat['dist_from_24h_low'] = (c - low_24) / atr_price.clip(lower=1e-10)
+    feat['dist_from_24h_low']  = (c - low_24)  / atr_price.clip(lower=1e-10)
 
-    # ── SESSION FLAGS ──
+    # Session flags
     hour = df_features.index.hour
-    feat['hour_sin'] = np.sin(2 * np.pi * hour / 24)
-    feat['hour_cos'] = np.cos(2 * np.pi * hour / 24)
-    feat['dow_sin'] = np.sin(2 * np.pi * df_features.index.dayofweek / 5)
-    feat['dow_cos'] = np.cos(2 * np.pi * df_features.index.dayofweek / 5)
-    feat['is_london'] = ((hour >= 7) & (hour < 16)).astype(np.float32)
-    feat['is_ny'] = ((hour >= 13) & (hour < 22)).astype(np.float32)
-    feat['is_overlap'] = ((hour >= 13) & (hour < 16)).astype(np.float32)
-    feat['is_asia'] = ((hour >= 0) & (hour < 7)).astype(np.float32)
+    feat['hour_sin']  = np.sin(2 * np.pi * hour / 24)
+    feat['hour_cos']  = np.cos(2 * np.pi * hour / 24)
+    feat['dow_sin']   = np.sin(2 * np.pi * df_features.index.dayofweek / 5)
+    feat['dow_cos']   = np.cos(2 * np.pi * df_features.index.dayofweek / 5)
+    feat['is_london'] = ((hour >= 7)  & (hour < 16)).astype(np.float32)
+    feat['is_ny']     = ((hour >= 13) & (hour < 22)).astype(np.float32)
+    feat['is_overlap']= ((hour >= 13) & (hour < 16)).astype(np.float32)
+    feat['is_asia']   = ((hour >= 0)  & (hour <  7)).astype(np.float32)
 
-    # ── CANDLE STRUCTURE ──
-    body = (c - o).abs()
+    # Candle structure
+    body       = (c - o).abs()
     full_range = (h - l).clip(lower=1e-10)
-    feat['body_ratio'] = body / full_range
-    feat['upper_wick_ratio'] = (h - np.maximum(o, c)) / full_range
-    feat['lower_wick_ratio'] = (np.minimum(o, c) - l) / full_range
-    feat['candle_direction'] = np.sign(c - o)
-
+    feat['body_ratio']        = body / full_range
+    feat['upper_wick_ratio']  = (h - np.maximum(o, c)) / full_range
+    feat['lower_wick_ratio']  = (np.minimum(o, c) - l) / full_range
+    feat['candle_direction']  = np.sign(c - o)
     direction = feat['candle_direction']
-    feat['consec_bullish'] = direction.rolling(6, min_periods=1).apply(
-        lambda x: (x > 0).sum(), raw=True)
-    feat['consec_bearish'] = direction.rolling(6, min_periods=1).apply(
-        lambda x: (x < 0).sum(), raw=True)
+    feat['consec_bullish'] = direction.rolling(6, min_periods=1).apply(lambda x: (x > 0).sum(), raw=True)
+    feat['consec_bearish'] = direction.rolling(6, min_periods=1).apply(lambda x: (x < 0).sum(), raw=True)
 
-    # ── FEATURE MOMENTUM (deltas of key microstructure features) ──
-    key_features = ['hurst_6h', 'vr_5', 'entropy_norm', 'order_imbalance',
-                    'kyle_lambda', 'jump_ratio', 'rv_yang_zhang']
-    for col in key_features:
+    # Feature momentum deltas
+    for col in ['hurst_6h', 'vr_5', 'entropy_norm', 'order_imbalance',
+                'kyle_lambda', 'jump_ratio', 'rv_yang_zhang']:
         if col in df_features.columns:
-            series = df_features[col]
-            feat[f'{col}_delta_3h'] = series.diff(3)
-            feat[f'{col}_delta_6h'] = series.diff(6)
-            feat[f'{col}_delta_12h'] = series.diff(12)
+            s = df_features[col]
+            feat[f'{col}_delta_3h']  = s.diff(3)
+            feat[f'{col}_delta_6h']  = s.diff(6)
+            feat[f'{col}_delta_12h'] = s.diff(12)
 
-    # ── VOLUME CONTEXT ──
-    feat['volume_ratio_6'] = v / v.rolling(6, min_periods=2).mean().clip(lower=1)
+    # Volume context
+    feat['volume_ratio_6']  = v / v.rolling(6,  min_periods=2).mean().clip(lower=1)
     feat['volume_ratio_24'] = v / v.rolling(24, min_periods=6).mean().clip(lower=1)
 
-    # Convert to float32
     for col in feat.columns:
         feat[col] = feat[col].astype(np.float32)
-
     return feat
 
 
+def compute_momentum_features(pair, close_1h_series, close_1h_all):
+    """Layer 3: Multi-timeframe momentum, range pos 5D/10D, vol regime, calendar, peer returns.
+    Mirrors build_nb8_01.py → compute_new_features()
+    """
+    c = close_1h_series
+    feat = pd.DataFrame(index=c.index)
+
+    # Multi-timeframe returns
+    feat['ret_1d'] = np.log(c / c.shift(24))
+    feat['ret_3d'] = np.log(c / c.shift(72))
+    feat['ret_1w'] = np.log(c / c.shift(168))
+    feat['ret_2w'] = np.log(c / c.shift(336))
+
+    # 5D/10D range position
+    high_5d  = c.rolling(120, min_periods=24).max()
+    low_5d   = c.rolling(120, min_periods=24).min()
+    high_10d = c.rolling(240, min_periods=48).max()
+    low_10d  = c.rolling(240, min_periods=48).min()
+    range_5d  = (high_5d  - low_5d).clip(lower=1e-10)
+    range_10d = (high_10d - low_10d).clip(lower=1e-10)
+    feat['range_pos_5d']   = (c - low_5d)   / range_5d
+    feat['range_pos_10d']  = (c - low_10d)  / range_10d
+    feat['dist_5d_high']   = (high_5d  - c) / range_5d
+    feat['dist_5d_low']    = (c - low_5d)   / range_5d
+    feat['range_width_5d'] = range_5d / c
+
+    # Volatility regime
+    pct = c.pct_change()
+    rv_24h = pct.rolling(24,  min_periods=8).std()
+    rv_5d  = pct.rolling(120, min_periods=24).std()
+    rv_10d = pct.rolling(240, min_periods=48).std()
+    feat['vol_regime_5d']  = rv_24h / rv_5d.clip(lower=1e-10)
+    feat['vol_regime_10d'] = rv_24h / rv_10d.clip(lower=1e-10)
+    feat['vol_trend']      = rv_5d  / rv_10d.clip(lower=1e-10)
+
+    # Calendar
+    idx = feat.index
+    feat['is_month_end']   = ((idx + pd.Timedelta(days=1)).month != idx.month).astype(np.float32)
+    feat['days_to_friday'] = ((4 - idx.dayofweek) % 7).astype(np.float32)
+    feat['is_quarter_end'] = (
+        ((idx + pd.Timedelta(days=1)).month != idx.month) &
+        pd.Index(idx.month).isin([3, 6, 9, 12])
+    ).astype(np.float32)
+    feat['is_month_end_3d'] = pd.Series(
+        [int((pd.Timestamp(t.year, t.month, 1) + pd.offsets.MonthEnd(1) - t).days <= 3) for t in idx],
+        index=idx, dtype=np.float32
+    )
+
+    # Cross-pair peer returns
+    for peer in CROSS_PEERS.get(pair, []):
+        if peer not in close_1h_all:
+            continue
+        pc = close_1h_all[peer].reindex(feat.index, method='ffill')
+        slug = peer.lower()
+        feat[f'peer_{slug}_ret_1h']  = np.log(pc / pc.shift(1))
+        feat[f'peer_{slug}_ret_4h']  = np.log(pc / pc.shift(4))
+        feat[f'peer_{slug}_ret_24h'] = np.log(pc / pc.shift(24))
+
+    return feat.astype(np.float32)
+
+
+def compute_cross_pair_features(pair, close_1h_all):
+    """Layer 4: Rolling corr, beta, relstr, CSI.
+    Mirrors notebooks_8/01_features_extended.ipynb → compute_correlation_features()
+    """
+    if pair not in close_1h_all:
+        return pd.DataFrame()
+
+    # Build returns matrix for all available pairs
+    ret_all = {p: np.log(close_1h_all[p] / close_1h_all[p].shift(1))
+               for p in close_1h_all}
+    returns_df = pd.DataFrame(ret_all)
+
+    # CSI
+    csi = {}
+    for ccy in CURRENCIES:
+        components = []
+        for p, signs in CURRENCY_SIGN.items():
+            if ccy in signs and p in returns_df.columns:
+                components.append(signs[ccy] * returns_df[p])
+        if components:
+            csi[f'csi_{ccy.lower()}'] = pd.concat(components, axis=1).mean(axis=1)
+    csi_df = pd.DataFrame(csi)
+    csi_rolling = {}
+    for col in csi_df.columns:
+        csi_rolling[f'{col}_24h'] = csi_df[col].rolling(24, min_periods=8).sum()
+        csi_rolling[f'{col}_72h'] = csi_df[col].rolling(72, min_periods=24).sum()
+    csi_rolling_df = pd.DataFrame(csi_rolling)
+
+    r    = returns_df[pair]
+    feat = pd.DataFrame(index=r.index)
+
+    for peer in CROSS_PEERS.get(pair, []):
+        if peer not in returns_df.columns:
+            continue
+        p    = returns_df[peer]
+        slug = peer.lower()
+
+        for w, label in [(24, '24h'), (72, '3d'), (168, '1w')]:
+            feat[f'corr_{slug}_{label}'] = r.rolling(w, min_periods=w//2).corr(p)
+        feat[f'corr_regime_{slug}'] = feat[f'corr_{slug}_24h'] - feat[f'corr_{slug}_1w']
+
+        for w, label in [(24, '24h'), (168, '1w')]:
+            cov = r.rolling(w, min_periods=w//2).cov(p)
+            var = p.rolling(w, min_periods=w//2).var().clip(lower=1e-12)
+            feat[f'beta_{slug}_{label}'] = cov / var
+
+        feat[f'relstr_{slug}_1h']  = r - p
+        feat[f'relstr_{slug}_4h']  = (
+            np.log(close_1h_all[pair] / close_1h_all[pair].shift(4)) -
+            np.log(close_1h_all[peer] / close_1h_all[peer].shift(4))
+        ).reindex(r.index)
+        feat[f'relstr_{slug}_24h'] = (
+            np.log(close_1h_all[pair] / close_1h_all[pair].shift(24)) -
+            np.log(close_1h_all[peer] / close_1h_all[peer].shift(24))
+        ).reindex(r.index)
+
+    for ccy, sign in CURRENCY_SIGN.get(pair, {}).items():
+        col = f'csi_{ccy.lower()}'
+        if col in csi_df.columns:
+            feat[col]             = csi_df[col].reindex(r.index)
+            feat[f'{col}_24h']    = csi_rolling_df[f'{col}_24h'].reindex(r.index)
+            feat[f'{col}_72h']    = csi_rolling_df[f'{col}_72h'].reindex(r.index)
+
+    return feat.astype(np.float32)
+
+
 def compute_features_for_pair(pair, data):
-    df_1m = data[pair]['1m']
-    df_5m = data[pair]['5m']
+    """Build microstructure features for one pair (layers 1+2)."""
+    df_1m  = data[pair]['1m']
+    df_5m  = data[pair]['5m']
     df_15m = data[pair]['15m']
-    df_1h = data[pair]['1h']
+    df_1h  = data[pair]['1h']
 
     df_1m['hour'] = df_1m.index.floor('h')
     hours = sorted(df_1m['hour'].unique())
 
-    all_features = []
+    all_features   = []
     returns_1m_dict = {}
-    rolling_sigma = None
+    rolling_sigma  = None
 
     for hour_ts in hours:
-        mask_1m = df_1m['hour'] == hour_ts
-        df_1m_hour = df_1m[mask_1m]
-
-        hour_end = hour_ts + pd.Timedelta(hours=1)
-        df_5m_hour = df_5m[(df_5m.index >= hour_ts) & (df_5m.index < hour_end)]
+        mask_1m     = df_1m['hour'] == hour_ts
+        df_1m_hour  = df_1m[mask_1m]
+        hour_end    = hour_ts + pd.Timedelta(hours=1)
+        df_5m_hour  = df_5m[(df_5m.index >= hour_ts) & (df_5m.index < hour_end)]
         df_15m_hour = df_15m[(df_15m.index >= hour_ts) & (df_15m.index < hour_end)]
 
         feat, ret_1m = compute_hour_features(df_1m_hour, df_5m_hour, df_15m_hour, rolling_sigma)
-
         if feat is not None:
             feat['datetime'] = hour_ts
             all_features.append(feat)
             returns_1m_dict[hour_ts] = ret_1m
-
-            hour_sigma = np.std(ret_1m)
-            if rolling_sigma is None:
-                rolling_sigma = hour_sigma
-            else:
-                rolling_sigma = 0.95 * rolling_sigma + 0.05 * hour_sigma
+            hour_sigma    = np.std(ret_1m)
+            rolling_sigma = hour_sigma if rolling_sigma is None else 0.95 * rolling_sigma + 0.05 * hour_sigma
 
     if not all_features:
         return pd.DataFrame()
@@ -952,83 +1075,128 @@ def compute_features_for_pair(pair, data):
     df_features = compute_trailing_features(df_features, returns_1m_dict)
     df_features['pair'] = pair
 
-    # Add contextual features (features_6)
+    # Layer 2: contextual (ATR, range, sessions, candle, deltas, volume)
     df_extra = compute_contextual_features(df_features, df_1h, pair)
     df_features = df_features.join(df_extra, how='left')
 
-    close_1h = df_1h['close'].reindex(df_features.index, method='ffill')
-    close_1h_3 = df_1h['close'].shift(-3).reindex(df_features.index, method='ffill')
-    df_features['label_1H'] = np.log(close_1h_3 / close_1h)
+    close_1h   = df_1h['close'].reindex(df_features.index, method='ffill')
+    close_1h_1 = df_1h['close'].shift(-1).reindex(df_features.index, method='ffill')
+    df_features['label_1H']    = np.log(close_1h_1 / close_1h)
     df_features['entry_price'] = close_1h
-    df_features['exit_price'] = close_1h_3
+    df_features['exit_price']  = close_1h_1
 
     float_cols = df_features.select_dtypes(include=[np.float64]).columns
     df_features[float_cols] = df_features[float_cols].astype(np.float32)
-
     return df_features
 
 
+def compute_all_features(data):
+    """Build full feature set for all pairs, including cross-pair layers 3+4.
+
+    Order matters:
+    1. Per-pair microstructure (layers 1+2) — independent, no cross-pair
+    2. Layer 3: momentum, vol regime, calendar, peer returns — needs close_1h_all
+    3. Layer 4: corr, beta, relstr, CSI — needs returns of all pairs
+    """
+    # Step 1: microstructure per pair
+    pair_dfs = {}
+    for pair in PAIRS:
+        if pair not in data:
+            continue
+        print(f'  Features [{pair}]...', end=' ', flush=True)
+        df = compute_features_for_pair(pair, data)
+        if not df.empty:
+            pair_dfs[pair] = df
+            print(f'{len(df):,} rows')
+        else:
+            print('empty')
+
+    if not pair_dfs:
+        return pd.DataFrame()
+
+    # Build close_1h_all for cross-pair layers
+    close_1h_all = {pair: data[pair]['1h']['close'] for pair in pair_dfs}
+
+    # Step 2: momentum + peer returns (layer 3)
+    for pair, df in pair_dfs.items():
+        close_series = data[pair]['1h']['close']
+        mom = compute_momentum_features(pair, close_series, close_1h_all)
+        mom = mom.reindex(df.index)
+        for col in mom.columns:
+            if col not in df.columns:
+                pair_dfs[pair][col] = mom[col]
+
+    # Step 3: corr + beta + relstr + CSI (layer 4)
+    for pair, df in pair_dfs.items():
+        cross = compute_cross_pair_features(pair, close_1h_all)
+        cross = cross.reindex(df.index)
+        for col in cross.columns:
+            if col not in df.columns:
+                pair_dfs[pair][col] = cross[col]
+
+    df_all = pd.concat(list(pair_dfs.values())).sort_index()
+    float_cols = df_all.select_dtypes(include=[np.float64]).columns
+    df_all[float_cols] = df_all[float_cols].astype(np.float32)
+    return df_all
+
+
 # ──────────────────────────────────────────────
-# MODEL INFERENCE (no rescue model)
+# MODEL INFERENCE — MFE Q50 + Direction Model
 # ──────────────────────────────────────────────
 def run_inference(df_all):
-    q50_bundle = joblib.load(MODELS_DIR / 'model_1H_Q50.joblib')
-    q25_bundle = joblib.load(MODELS_DIR / 'model_1H_Q25.joblib')
-    q75_bundle = joblib.load(MODELS_DIR / 'model_1H_Q75.joblib')
-    meta_bundle = joblib.load(META_DIR / 'meta_confidence.joblib')
+    # 1. MFE model — gates whether to trade at all
+    mfe_bundle = joblib.load(MODELS_DIR / 'model_1H_Q50.joblib')
+    mfe_feature_cols = mfe_bundle['feature_cols']
+    missing_mfe = [c for c in mfe_feature_cols if c not in df_all.columns]
+    if missing_mfe:
+        print(f'  WARNING: {len(missing_mfe)} MFE features missing, filling 0: {missing_mfe[:5]}')
+        for col in missing_mfe:
+            df_all[col] = 0.0
+    X_mfe = df_all[mfe_feature_cols].groupby(df_all['pair']).ffill().fillna(0)
+    df_all['mfe_q50'] = mfe_bundle['model'].predict(X_mfe)
 
-    feature_cols = q50_bundle['feature_cols']
-    meta_feature_cols = meta_bundle['meta_feature_cols']
+    # 2. Direction model — trained on MFE>70 population, predicts long (1) or short (0)
+    dir_bundle = joblib.load(DIR_MODELS_DIR / 'direction_model.joblib')
+    dir_feature_cols = dir_bundle['feature_cols']
 
-    X = df_all[feature_cols].groupby(df_all['pair']).ffill().fillna(0)
+    # direction model needs mfe_q50 as a feature (use live MFE prediction directly)
+    df_all['mfe_q50_oof'] = df_all['mfe_q50']
 
-    q50_pred = q50_bundle['model'].predict(X)
-    q25_pred = q25_bundle['model'].predict(X)
-    q75_pred = q75_bundle['model'].predict(X)
+    missing_dir = [c for c in dir_feature_cols if c not in df_all.columns]
+    if missing_dir:
+        print(f'  WARNING: {len(missing_dir)} dir features missing, filling 0: {missing_dir[:5]}')
+        for col in missing_dir:
+            df_all[col] = 0.0
+    X_dir = df_all[dir_feature_cols].groupby(df_all['pair']).ffill().fillna(0)
+    prob_long = dir_bundle['model'].predict_proba(X_dir)[:, 1]
+    df_all['dir_prob_long'] = prob_long
 
-    df_all['Q50'] = q50_pred
-    df_all['Q25'] = q25_pred
-    df_all['Q75'] = q75_pred
-    df_all['abs_Q50'] = np.abs(q50_pred)
-    df_all['pred_dir'] = np.sign(q50_pred)
-    df_all['actual_dir'] = np.sign(df_all['label_1H'])
+    # pred_dir: 1=long, -1=short (using sign convention for pnl calc)
+    df_all['pred_dir'] = np.where(df_all['dir_prob_long'] >= 0.5, 1, -1)
 
-    df_all['Q50_oof'] = q50_pred
-    df_all['Q25_oof'] = q25_pred
-    df_all['Q75_oof'] = q75_pred
-    df_all['iqr'] = q75_pred - q25_pred
-    df_all['conf_ratio'] = np.abs(q50_pred) / np.clip(df_all['iqr'], 1e-10, None)
+    # Direction confidence filter: skip weak signals
+    df_all['dir_confident'] = (
+        (df_all['dir_prob_long'] >= DIR_THRESHOLD) |
+        (df_all['dir_prob_long'] <= (1 - DIR_THRESHOLD))
+    )
 
-    tradeable_mask = df_all['abs_Q50'] > MIN_Q50_THRESHOLD
-    df_tradeable = df_all[tradeable_mask].copy()
+    tradeable_mask = (df_all['mfe_q50'] > MFE_THRESHOLD) & df_all['dir_confident']
+    mfe_only_mask  = df_all['mfe_q50'] > MFE_THRESHOLD
 
-    df_all['meta_proba'] = np.nan
-    if len(df_tradeable) > 0:
-        X_meta = df_tradeable[meta_feature_cols].groupby(df_tradeable['pair']).ffill().fillna(0)
-        meta_proba = meta_bundle['model'].predict_proba(X_meta)[:, 1]
-        df_all.loc[tradeable_mask, 'meta_proba'] = meta_proba
-
-    meta_accepted = tradeable_mask & (df_all['meta_proba'] > META_THRESHOLD)
     print(f'  Total hours: {len(df_all):,}')
-    print(f'  Tradeable (|Q50|>0.5x): {tradeable_mask.sum():,}')
-    print(f'  Meta-accepted (P>{META_THRESHOLD}): {meta_accepted.sum():,}')
+    print(f'  MFE Q50 > {MFE_THRESHOLD} pips: {mfe_only_mask.sum():,} ({mfe_only_mask.mean():.1%})')
+    print(f'  After direction filter (>{DIR_THRESHOLD}/<{1-DIR_THRESHOLD}): {tradeable_mask.sum():,} ({tradeable_mask.mean():.1%})')
+    print(f'  Long: {(df_all.loc[tradeable_mask,"pred_dir"]==1).sum():,}  Short: {(df_all.loc[tradeable_mask,"pred_dir"]==-1).sum():,}')
 
-    # Diagnostic: hourly distribution — base model vs meta model
-    print(f'\n--- Hourly Distribution: Base Model vs Meta ---')
-    print(f'{"Hour UTC":<10} {"Base(Q50)":>10} {"%":>6} {"Meta P>0.5":>12} {"%":>6} {"Meta/Base":>10}')
-    print('-' * 58)
-    base_hours = df_all[tradeable_mask].index.hour.value_counts().sort_index()
-    meta_hours = df_all[meta_accepted].index.hour.value_counts().sort_index()
-    base_total = tradeable_mask.sum()
-    meta_total = meta_accepted.sum()
-    for h in range(24):
-        b = base_hours.get(h, 0)
-        m = meta_hours.get(h, 0)
-        b_pct = 100 * b / base_total if base_total > 0 else 0
-        m_pct = 100 * m / meta_total if meta_total > 0 else 0
-        ratio = m / b if b > 0 else 0
-        if b > 0 or m > 0:
-            print(f'{h:02d}:00     {b:>10} {b_pct:>5.1f}% {m:>12} {m_pct:>5.1f}% {ratio:>9.1%}')
+    # Hourly distribution of filtered bars
+    print(f'\n--- Hourly Distribution (MFE > {MFE_THRESHOLD} + dir filter) ---')
+    hour_counts = df_all[tradeable_mask].index.hour.value_counts().sort_index()
+    total = tradeable_mask.sum()
+    if total > 0:
+        for h in range(24):
+            c = hour_counts.get(h, 0)
+            bar = '#' * int(c / total * 40)
+            print(f'  {h:02d}:00  {c:>6}  {100*c/total:>5.1f}%  {bar}')
 
     return df_all
 
@@ -1036,29 +1204,78 @@ def run_inference(df_all):
 # ──────────────────────────────────────────────
 # CAPITAL SIMULATION
 # ──────────────────────────────────────────────
-def simulate_capital(df_all, backtest_start):
+def get_fixed_exit(pair, data, entry_time, entry_price, direction, tp_pips, sl_pips, max_bars=72):
+    """Walk forward hourly bars up to max_bars.
+    Exit when TP or SL is hit (using bar high/low), or at max_bars close.
+    Returns (exit_price, exit_type, bars_held)."""
+    pip = PIP_SIZE.get(pair, 0.0001)
+    tp_price = entry_price + direction * tp_pips * pip
+    sl_price = entry_price - direction * sl_pips * pip
+
+    df_1h = data.get(pair, {}).get('1h', pd.DataFrame())
+    if df_1h.empty:
+        return entry_price, 'CLOSE', 0
+
+    for bar_n in range(1, max_bars + 1):
+        bar_time = entry_time + pd.Timedelta(hours=bar_n)
+        if bar_time not in df_1h.index:
+            continue
+        bar = df_1h.loc[bar_time]
+
+        if direction == 1:
+            if bar['low'] <= sl_price and bar['high'] >= tp_price:
+                # Both in same bar — use open to determine order
+                return (tp_price, 'TP', bar_n) if bar['open'] > sl_price else (sl_price, 'SL', bar_n)
+            if bar['low'] <= sl_price:
+                return sl_price, 'SL', bar_n
+            if bar['high'] >= tp_price:
+                return tp_price, 'TP', bar_n
+        else:
+            if bar['high'] >= sl_price and bar['low'] <= tp_price:
+                return (tp_price, 'TP', bar_n) if bar['open'] < sl_price else (sl_price, 'SL', bar_n)
+            if bar['high'] >= sl_price:
+                return sl_price, 'SL', bar_n
+            if bar['low'] <= tp_price:
+                return tp_price, 'TP', bar_n
+
+    # Max bars reached — exit at close
+    last_bar_time = entry_time + pd.Timedelta(hours=max_bars)
+    if last_bar_time in df_1h.index:
+        return df_1h.loc[last_bar_time, 'close'], 'MAX_BARS', max_bars
+    return entry_price, 'CLOSE', max_bars
+
+
+def simulate_capital(df_all, backtest_start, data):
     """Simulate trading with real capital, margin, spreads, and lot sizing."""
+
     df = df_all[df_all.index >= backtest_start].copy()
     df = df[df['label_1H'].notna()].copy()
 
-    # Dynamic config: meta P>0.5 + Q50>0.7x spread, OR bypass meta if Q50>1x spread
-    HIGH_CONV_THRESHOLD = AVG_SPREAD * 1.0
-    meta_path = (df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)
-    high_conv_path = df['abs_Q50'] > HIGH_CONV_THRESHOLD
-    df_signals = df[meta_path | high_conv_path].copy()
+    # MFE gate + direction confidence filter
+    df_signals = df[
+        (df['mfe_q50'] > MFE_THRESHOLD) & df['dir_confident']
+    ].copy()
 
-    # Apply 3H cooldown per pair
+    # Cooldown: pre-compute exit time per signal, lock pair until exit
+    # We need to resolve exits to determine cooldown — do a dry run first
     df_signals = df_signals.sort_index()
     pair_unlock_time = {}
     keep = []
+    exit_times = []
     for idx, row in df_signals.iterrows():
         pair = row['pair']
         unlock = pair_unlock_time.get(pair)
         if unlock is not None and idx < unlock:
             keep.append(False)
+            exit_times.append(None)
         else:
+            _, _, bars_held = get_fixed_exit(
+                pair, data, idx, row['entry_price'],
+                int(row['pred_dir']), tp_pips=50.0, sl_pips=25.0)
+            exit_time = idx + pd.Timedelta(hours=max(bars_held, 1))
             keep.append(True)
-            pair_unlock_time[pair] = idx + pd.Timedelta(hours=3)
+            exit_times.append(exit_time)
+            pair_unlock_time[pair] = exit_time
     df_signals = df_signals[keep].copy()
 
     print(f'\n{"="*80}')
@@ -1099,6 +1316,9 @@ def simulate_capital(df_all, backtest_start):
 
                 equity += pnl  # P&L only (margin tracked separately)
 
+                pip = PIP_SIZE.get(pos['pair'], 0.0001)
+                pip_move = (pos['exit_price'] - pos['entry_price']) * pos['direction'] / pip
+
                 trades.append({
                     'datetime': pos['open_at'],
                     'close_at': hour,
@@ -1111,8 +1331,10 @@ def simulate_capital(df_all, backtest_start):
                     'slippage_cost': slippage_cost,
                     'pnl_usd': pnl,
                     'equity_after': equity,
-                    'meta_proba': pos['meta_proba'],
-                    'q50': pos['q50'],
+                    'mfe_pred': pos['mfe_pred'],
+                    'pip_move': pip_move,
+                    'exit_type': pos.get('exit_type', 'CLOSE'),
+                    'bars_held': pos.get('bars_held', 1),
                 })
             else:
                 still_open.append(pos)
@@ -1125,10 +1347,9 @@ def simulate_capital(df_all, backtest_start):
             for _, sig in hour_signals.iterrows():
                 pair = sig['pair']
                 entry_price = sig['entry_price']
-                exit_price_2h = sig['exit_price']
-                q50 = sig['Q50']
-                meta_p = sig['meta_proba']
+                mfe_pred = sig['mfe_q50']
                 direction = int(sig['pred_dir'])
+                pip = PIP_SIZE.get(pair, 0.0001)
 
                 # Spread filter (time-aware)
                 hour_utc = hour.hour
@@ -1159,8 +1380,8 @@ def simulate_capital(df_all, backtest_start):
                 else:
                     target_lots = 1.0  # fallback
 
-                # Apply market capacity cap
-                cap = CAPACITY_CAPS.get(pair, 10)
+                # Apply market capacity cap and hard lot ceiling
+                cap = min(CAPACITY_CAPS.get(pair, 10), 5.0)
                 target_lots = min(target_lots, cap)
                 target_lots = max(round(target_lots, 1), 0.1)
 
@@ -1181,17 +1402,21 @@ def simulate_capital(df_all, backtest_start):
                 rv_raw = sig.get('rv_close', np.nan)
                 ann_vol = np.sqrt(rv_raw * 252 * 24) if pd.notna(rv_raw) and rv_raw > 0 else None
 
+                exit_price, exit_type, bars_held = get_fixed_exit(
+                    pair, data, hour, entry_price, direction, tp_pips=50.0, sl_pips=25.0)
+
                 open_positions.append({
                     'pair': pair,
                     'direction': direction,
                     'lots': lots,
                     'entry_price': entry_price,
-                    'exit_price': exit_price_2h,
+                    'exit_price': exit_price,
+                    'exit_type': exit_type,
+                    'bars_held': bars_held,
                     'margin_used': margin_needed,
                     'open_at': hour,
-                    'close_at': hour + pd.Timedelta(hours=3),
-                    'meta_proba': meta_p,
-                    'q50': q50,
+                    'close_at': hour + pd.Timedelta(hours=bars_held),
+                    'mfe_pred': mfe_pred,
                     'realized_vol': ann_vol,
                 })
 
@@ -1251,6 +1476,15 @@ def simulate_capital(df_all, backtest_start):
     print(f'Avg loss:           ${avg_loss:>10,.2f}')
     print(f'Avg P&L/trade:      ${avg_pnl:>10,.2f}')
     print(f'Profit factor:      {gross_wins / gross_losses:.2f}')
+    print(f'Avg pip move:       {df_trades["pip_move"].mean():+.1f} pips')
+    print(f'Avg |pip move|:     {df_trades["pip_move"].abs().mean():.1f} pips')
+    print(f'Median |pip move|:  {df_trades["pip_move"].abs().median():.1f} pips')
+    tp_n    = (df_trades['exit_type'] == 'TP').sum()
+    sl_n    = (df_trades['exit_type'] == 'SL').sum()
+    max_n   = (df_trades['exit_type'] == 'MAX_BARS').sum()
+    cl_n    = (df_trades['exit_type'] == 'CLOSE').sum()
+    print(f'Exit breakdown:     TP={tp_n} ({tp_n/total_trades:.1%})  SL={sl_n} ({sl_n/total_trades:.1%})  MAX_BARS={max_n} ({max_n/total_trades:.1%})  CLOSE={cl_n} ({cl_n/total_trades:.1%})')
+    print(f'Avg bars held:      {df_trades["bars_held"].mean():.1f}H')
 
     # Sharpe
     df_trades['date'] = pd.to_datetime(df_trades['datetime']).dt.date
@@ -1302,12 +1536,12 @@ def simulate_capital(df_all, backtest_start):
     print(f'\n--- Top 5 Wins ---')
     for _, t in df_trades.nlargest(5, 'pnl_usd').iterrows():
         print(f'  {t["datetime"]}  {t["pair"]:>8}  {t["direction"]}  {t["lots"]} lots  '
-              f'meta={t["meta_proba"]:.2f}  q50={t["q50"]:+.5f}  P&L=${t["pnl_usd"]:>+,.2f}')
+              f'mfe_pred={t["mfe_pred"]:.1f}  P&L=${t["pnl_usd"]:>+,.2f}')
 
     print(f'\n--- Top 5 Losses ---')
     for _, t in df_trades.nsmallest(5, 'pnl_usd').iterrows():
         print(f'  {t["datetime"]}  {t["pair"]:>8}  {t["direction"]}  {t["lots"]} lots  '
-              f'meta={t["meta_proba"]:.2f}  q50={t["q50"]:+.5f}  P&L=${t["pnl_usd"]:>+,.2f}')
+              f'mfe_pred={t["mfe_pred"]:.1f}  P&L=${t["pnl_usd"]:>+,.2f}')
 
     # ── Hour-of-day analysis ──
     print(f'\n--- P&L by Hour of Day ---')
@@ -1327,16 +1561,15 @@ def simulate_capital(df_all, backtest_start):
     print(f'\n{"="*80}')
     print(f'FULL TRADE LOG')
     print(f'{"="*80}')
-    print(f'{"#":>4} {"Entry Time":<20} {"Exit Time":<20} {"Pair":<8} {"Side":<5} {"Lots":>5} '
-          f'{"Entry":>10} {"Exit":>10} {"Spread$":>8} {"Slip$":>7} {"P&L":>10} {"Result":<6} {"Equity":>12}')
-    print('-' * 135)
+    print(f'{"#":>4} {"Entry Time":<20} {"Pair":<8} {"Side":<5} {"Lots":>5} '
+          f'{"Entry":>10} {"Exit":>10} {"MFEpred":>8} {"Spread$":>8} {"Slip$":>7} {"P&L":>10} {"Result":<6} {"Equity":>12}')
+    print('-' * 130)
     for i, (_, t) in enumerate(df_trades.iterrows(), 1):
         result = 'WIN' if t['pnl_usd'] > 0 else 'LOSS'
         entry_str = str(t['datetime'])[:16]
-        exit_str = str(t['close_at'])[:16]
-        print(f'{i:>4} {entry_str:<20} {exit_str:<20} {t["pair"]:<8} {t["direction"]:<5} {t["lots"]:>5} '
-              f'{t["entry_price"]:>10.5f} {t["exit_price"]:>10.5f} ${t["spread_cost"]:>7.2f} '
-              f'${t["slippage_cost"]:>6.2f} ${t["pnl_usd"]:>+9.2f} {result:<6} ${t["equity_after"]:>11,.2f}')
+        print(f'{i:>4} {entry_str:<20} {t["pair"]:<8} {t["direction"]:<5} {t["lots"]:>5} '
+              f'{t["entry_price"]:>10.5f} {t["exit_price"]:>10.5f} {t["mfe_pred"]:>8.1f} '
+              f'${t["spread_cost"]:>7.2f} ${t["slippage_cost"]:>6.2f} ${t["pnl_usd"]:>+9.2f} {result:<6} ${t["equity_after"]:>11,.2f}')
 
     return df_trades, df_equity
 
@@ -1349,20 +1582,10 @@ async def main():
 
     data = await fetch_all_pairs()
 
-    print(f'\nComputing microstructure features...')
-    all_dfs = []
-    for pair in PAIRS:
-        if pair not in data:
-            continue
-        print(f'  {pair}...', end=' ', flush=True)
-        t0 = time.time()
-        df_feat = compute_features_for_pair(pair, data)
-        elapsed = time.time() - t0
-        print(f'{len(df_feat):,} hours ({elapsed:.1f}s)')
-        all_dfs.append(df_feat)
-
-    df_all = pd.concat(all_dfs).sort_index()
-    print(f'Total feature rows: {len(df_all):,}')
+    print(f'\nComputing features (all layers)...')
+    t0 = time.time()
+    df_all = compute_all_features(data)
+    print(f'Total feature rows: {len(df_all):,} ({time.time()-t0:.1f}s)')
 
     print(f'\nRunning model inference...')
     df_all = run_inference(df_all)
@@ -1370,34 +1593,7 @@ async def main():
     backtest_start = df_all.index.min() + pd.Timedelta(days=WARMUP_DAYS)
     print(f'Backtest starts: {backtest_start.date()} (after {WARMUP_DAYS} days warmup)')
 
-    # ── Run 3 stress scenarios ──
-    scenarios = [
-        (1.0, 'BASELINE   (off-hour spread × 1x)'),
-        (3.0, 'STRESS 3x  (off-hour spread × 3x)'),
-        (5.0, 'STRESS 5x  (off-hour spread × 5x)'),
-    ]
-
-    summary = []
-    for stress_mult, label in scenarios:
-        print(f'\n{"="*60}')
-        print(f'SCENARIO: {label}')
-        print(f'{"="*60}')
-        apply_stress(stress_mult)
-        df_trades, df_equity = simulate_capital(df_all, backtest_start)
-
-        if df_equity is not None and len(df_equity) > 0:
-            final_equity = df_equity['equity'].iloc[-1]
-            ret_pct = (final_equity - STARTING_CAPITAL) / STARTING_CAPITAL * 100
-            n_trades = len(df_trades) if df_trades is not None else 0
-            summary.append((label, ret_pct, n_trades, final_equity))
-
-    print(f'\n{"="*60}')
-    print(f'STRESS TEST SUMMARY')
-    print(f'{"="*60}')
-    print(f'{"Scenario":<40} {"Return":>10} {"Trades":>8} {"Final Equity":>15}')
-    print(f'{"-"*75}')
-    for label, ret_pct, n_trades, final_eq in summary:
-        print(f'{label:<40} {ret_pct:>+9.1f}% {n_trades:>8,}  ${final_eq:>13,.0f}')
+    df_trades, df_equity = simulate_capital(df_all, backtest_start, data)
 
     elapsed_total = time.time() - t_start
     print(f'\nTotal runtime: {elapsed_total:.0f}s')

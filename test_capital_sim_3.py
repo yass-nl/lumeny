@@ -9,7 +9,7 @@ Same pipeline as live backtest v5.2 (features, Q50, meta-model), but with:
 - Actual $ P&L per trade, equity curve, drawdown tracking
 - Spread filter: skip if spread > 30 points
 
-Config: Meta P>0.55 + |Q50|>0.5x spread. 3H holding period.
+Config: Meta P>0.50 + |Q50|>0.7x spread, OR bypass meta if |Q50|>1.0x spread. 3H holding period. No entries at 21:00 UTC.
 """
 
 import os
@@ -36,8 +36,8 @@ REST_BASE = 'https://api.polygon.io'
 PAIRS = [
     # Majors
     'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
-    # Liquid crosses only
-    'EURJPY', 'GBPJPY', 'EURGBP',
+    # Crosses
+    'EURJPY', 'GBPJPY', 'EURGBP', 'EURAUD', 'AUDJPY', 'CADJPY', 'CHFJPY', 'AUDNZD',
 ]
 
 MODELS_DIR = Path('backend/models_6/3_quants')
@@ -48,7 +48,7 @@ STARTING_CAPITAL = 1_000_000.0
 LOT_UNITS = 100_000       # 1 standard lot = 100,000 units
 MIN_MARGIN_TO_TRADE = 4_000
 MAX_SPREAD_POINTS = 50
-RISK_PER_TRADE = 0.005    # 0.5% of equity per trade
+RISK_PER_TRADE = 0.02     # 2% of equity per trade (Q25 strategy — high conviction, fewer trades)
 
 # Market capacity caps (lots) — from BIS 2022 analysis, 50% of 1% hourly volume / 4 simultaneous
 # Binding constraint is always the illiquid crosses
@@ -938,10 +938,10 @@ def compute_features_for_pair(pair, data):
     df_features = df_features.join(df_extra, how='left')
 
     close_1h = df_1h['close'].reindex(df_features.index, method='ffill')
-    close_1h_3 = df_1h['close'].shift(-3).reindex(df_features.index, method='ffill')
-    df_features['label_1H'] = np.log(close_1h_3 / close_1h)
+    close_1h_1 = df_1h['close'].shift(-1).reindex(df_features.index, method='ffill')
+    df_features['label_1H'] = np.log(close_1h_1 / close_1h)
     df_features['entry_price'] = close_1h
-    df_features['exit_price'] = close_1h_3
+    df_features['exit_price'] = close_1h_1
 
     float_cols = df_features.select_dtypes(include=[np.float64]).columns
     df_features[float_cols] = df_features[float_cols].astype(np.float32)
@@ -1022,11 +1022,13 @@ def simulate_capital(df_all, backtest_start):
     df = df_all[df_all.index >= backtest_start].copy()
     df = df[df['label_1H'].notna()].copy()
 
-    # Dynamic config: meta P>0.5 + Q50>0.7x spread, OR bypass meta if Q50>1x spread
-    HIGH_CONV_THRESHOLD = AVG_SPREAD * 1.0
-    meta_path = (df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)
-    high_conv_path = df['abs_Q50'] > HIGH_CONV_THRESHOLD
-    df_signals = df[meta_path | high_conv_path].copy()
+    # Q25/Q75 strategy: trade when pessimistic scenario is still positive/negative
+    # Q25 > 0 -> long (even bad case is positive), Q75 < 0 -> short (even good case is negative)
+    no_spike_hour = df.index.hour != 21
+    q25_long  = (df['Q25'] > 0) & no_spike_hour
+    q75_short = (df['Q75'] < 0) & no_spike_hour
+    df_signals = df[q25_long | q75_short].copy()
+    df_signals['pred_dir'] = np.where(df_signals['Q25'] > 0, 1, -1)
 
     # Apply 3H cooldown per pair
     df_signals = df_signals.sort_index()
@@ -1039,7 +1041,7 @@ def simulate_capital(df_all, backtest_start):
             keep.append(False)
         else:
             keep.append(True)
-            pair_unlock_time[pair] = idx + pd.Timedelta(hours=3)
+            pair_unlock_time[pair] = idx + pd.Timedelta(hours=1)
     df_signals = df_signals[keep].copy()
 
     print(f'\n{"="*80}')
@@ -1170,7 +1172,7 @@ def simulate_capital(df_all, backtest_start):
                     'exit_price': exit_price_2h,
                     'margin_used': margin_needed,
                     'open_at': hour,
-                    'close_at': hour + pd.Timedelta(hours=3),
+                    'close_at': hour + pd.Timedelta(hours=1),
                     'meta_proba': meta_p,
                     'q50': q50,
                     'realized_vol': ann_vol,
