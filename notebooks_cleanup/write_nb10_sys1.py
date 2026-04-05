@@ -1,0 +1,358 @@
+import json
+
+cells = []
+
+cells.append({
+    "cell_type": "markdown", "metadata": {},
+    "source": (
+        "# LumenY 10 — System 1: Trend Continuation in Liquid Hours\n\n"
+        "**Thesis:** When all timeframes agree on direction, price is positioned correctly "
+        "relative to structure, and microstructure confirms real flow — enter in the direction "
+        "of the trend during liquid sessions.\n\n"
+        "**No training. Pure rules. Full history valid.**\n\n"
+        "| Layer | Feature | Condition | Rationale |\n"
+        "|-------|---------|-----------|----------|\n"
+        "| Geometric | `slope_agree_3_24` | = 1 | All timeframes aligned |\n"
+        "| Geometric | `slope_close_24h` | > 0 long / < 0 short | 24h slope confirms direction |\n"
+        "| Geometric | `range_pos_24h` | >0.6 long / <0.4 short | Price in upper/lower range |\n"
+        "| Microstructure | `hurst_6h` | > 0.55 | Trending not mean-reverting |\n"
+        "| Microstructure | `kyle_lambda` | > `kyle_lambda_ma12` | Informed flow above average |\n"
+        "| Microstructure | `entropy_norm` | < 0.85 | Directional not noisy |\n"
+        "| Session | `is_london` or `is_ny` | = 1 | Liquid hours only |\n\n"
+        "**Exit:** Fixed hold of 4H (tunable)\n\n"
+        "**Spread:** 2.8 pips average across pairs"
+    )
+})
+
+cells.append({
+    "cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+    "source": (
+        "import pandas as pd\n"
+        "import numpy as np\n"
+        "import matplotlib.pyplot as plt\n"
+        "import warnings\n"
+        "warnings.filterwarnings('ignore')\n"
+        "from pathlib import Path\n\n"
+        "FEATURES_6_DIR = Path('../backend/data/features_6')\n"
+        "FEATURES_8_DIR = Path('../backend/data/features_8')\n"
+        "PROCESSED_DIR  = Path('../backend/data/processed')\n\n"
+        "AVG_SPREAD_PIPS = 2.8\n"
+        "HOLD_H = 4\n\n"
+        "PIP_SIZE = {\n"
+        "    'EURUSD':0.0001,'GBPUSD':0.0001,'AUDUSD':0.0001,'NZDUSD':0.0001,\n"
+        "    'USDCAD':0.0001,'USDCHF':0.0001,'USDJPY':0.01,\n"
+        "    'EURJPY':0.01,'GBPJPY':0.01,'AUDJPY':0.01,'CADJPY':0.01,\n"
+        "    'CHFJPY':0.01,'EURAUD':0.0001,'EURGBP':0.0001,'AUDNZD':0.0001,\n"
+        "}\n"
+        "# Max plausible 1H move — for data quality filter\n"
+        "MAX_1H_MOVE = {\n"
+        "    'EURUSD':150,'GBPUSD':200,'AUDUSD':120,'NZDUSD':100,'USDCAD':150,\n"
+        "    'USDCHF':150,'USDJPY':300,'EURJPY':300,'GBPJPY':350,'AUDJPY':250,\n"
+        "    'CADJPY':250,'CHFJPY':250,'EURAUD':150,'EURGBP':100,'AUDNZD':80,\n"
+        "}\n\n"
+        "PAIRS = list(PIP_SIZE.keys())\n"
+        "print('Setup complete.')\n"
+    )
+})
+
+cells.append({
+    "cell_type": "markdown", "metadata": {},
+    "source": "## 1. Load features_6 (microstructure) + features_8 (geometric) + 1H closes"
+})
+
+cells.append({
+    "cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+    "source": (
+        "# Load features_6 (microstructure)\n"
+        "dfs6 = []\n"
+        "for f in sorted(FEATURES_6_DIR.glob('*_features.parquet')):\n"
+        "    dfs6.append(pd.read_parquet(f))\n"
+        "df6 = pd.concat(dfs6).sort_index()\n"
+        "del dfs6\n"
+        "print(f'features_6: {df6.shape}')\n\n"
+        "# Load features_8 (geometric)\n"
+        "dfs8 = []\n"
+        "for f in sorted(FEATURES_8_DIR.glob('*_geometric.parquet')):\n"
+        "    pair = f.stem.replace('_geometric','')\n"
+        "    tmp = pd.read_parquet(f)\n"
+        "    tmp['pair'] = pair\n"
+        "    dfs8.append(tmp)\n"
+        "df8 = pd.concat(dfs8).sort_index()\n"
+        "del dfs8\n"
+        "print(f'features_8: {df8.shape}')\n\n"
+        "# Merge on (datetime, pair)\n"
+        "df6r = df6.reset_index()\n"
+        "df8r = df8.reset_index().drop(columns=[c for c in df8.columns if c in df6.columns and c != 'pair'], errors='ignore')\n"
+        "idx_col = df6r.columns[0]\n"
+        "df = pd.merge(df6r, df8r, on=[idx_col, 'pair'], how='inner')\n"
+        "df = df.set_index(idx_col).sort_index()\n"
+        "print(f'merged: {df.shape}')\n\n"
+        "# Load 1H closes for forward return computation\n"
+        "closes = {}\n"
+        "for pair in PAIRS:\n"
+        "    df1h = pd.read_parquet(PROCESSED_DIR / f'{pair}_1H.parquet')\n"
+        "    if 'datetime' in df1h.columns: df1h = df1h.set_index('datetime')\n"
+        "    df1h.index = pd.to_datetime(df1h.index)\n"
+        "    closes[pair] = df1h['close']\n"
+        "print(f'Loaded closes for {len(closes)} pairs')\n"
+    )
+})
+
+cells.append({
+    "cell_type": "markdown", "metadata": {},
+    "source": "## 2. Compute forward returns + data quality filter"
+})
+
+cells.append({
+    "cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+    "source": (
+        "rows = []\n"
+        "for pair in PAIRS:\n"
+        "    pip = PIP_SIZE[pair]\n"
+        "    max_move = MAX_1H_MOVE[pair]  # in pips\n"
+        "    df_p = df[df['pair'] == pair].copy()\n"
+        "    close = closes[pair].reindex(df_p.index)\n\n"
+        "    # Forward return for HOLD_H bars (simple price diff in pips)\n"
+        "    df_p['fwd_ret_pips'] = (close.shift(-HOLD_H) - close) / pip\n\n"
+        "    # Data quality: exclude bad ticks and holidays\n"
+        "    ret_1h = ((close.shift(-1) - close) / pip).abs()\n"
+        "    holiday = ~(\n"
+        "        ((df_p.index.month==12) & (df_p.index.day.isin([24,25,26,31]))) |\n"
+        "        ((df_p.index.month==1)  & (df_p.index.day.isin([1,2])))\n"
+        "    )\n"
+        "    df_p['clean'] = (ret_1h <= max_move) & holiday\n"
+        "    rows.append(df_p)\n\n"
+        "df_all = pd.concat(rows).sort_index()\n"
+        "print(f'Full dataset: {df_all.shape}')\n"
+        "print(f'Date range: {df_all.index.min().date()} -> {df_all.index.max().date()}')\n"
+        "print(f'Clean bars: {df_all[\"clean\"].sum():,} / {len(df_all):,}')\n"
+    )
+})
+
+cells.append({
+    "cell_type": "markdown", "metadata": {},
+    "source": "## 3. System 1 rules"
+})
+
+cells.append({
+    "cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+    "source": (
+        "def apply_system1(df, hold_h=4, spread=2.8):\n"
+        "    \"\"\"\n"
+        "    System 1: Trend Continuation in Liquid Hours\n"
+        "    Returns DataFrame with signal column: +1 long, -1 short, 0 no trade\n"
+        "    \"\"\"\n"
+        "    d = df.copy()\n\n"
+        "    # ── LONG conditions ──────────────────────────────────────────────\n"
+        "    long_geo = (\n"
+        "        (d['slope_agree_3_24'] == 1) &       # all timeframes up\n"
+        "        (d['slope_close_24h'] > 0) &          # 24h slope positive (trending up)\n"
+        "        (d['range_pos_24h'] > 0.6)            # price in upper part of 24h range\n"
+        "    )\n"
+        "    long_micro = (\n"
+        "        (d['hurst_6h'] > 0.55) &             # trending regime\n"
+        "        (d['kyle_lambda'] > d['kyle_lambda_ma12']) &  # informed flow above avg\n"
+        "        (d['entropy_norm'] < 0.85)            # directional not noisy\n"
+        "    )\n\n"
+        "    # ── SHORT conditions ─────────────────────────────────────────────\n"
+        "    short_geo = (\n"
+        "        (d['slope_agree_3_24'] == 1) &        # all timeframes aligned\n"
+        "        (d['slope_close_24h'] < 0) &           # 24h slope negative (trending down)\n"
+        "        (d['range_pos_24h'] < 0.4)            # price in lower part of 24h range\n"
+        "    )\n"
+        "    short_micro = (\n"
+        "        (d['hurst_6h'] > 0.55) &\n"
+        "        (d['kyle_lambda'] > d['kyle_lambda_ma12']) &\n"
+        "        (d['entropy_norm'] < 0.85)\n"
+        "    )\n\n"
+        "    # ── Session filter ───────────────────────────────────────────────\n"
+        "    liquid = (d['is_london'] == 1) | (d['is_ny'] == 1)\n\n"
+        "    # ── Combine ──────────────────────────────────────────────────────\n"
+        "    d['signal'] = 0\n"
+        "    d.loc[long_geo  & long_micro  & liquid & d['clean'], 'signal'] =  1\n"
+        "    d.loc[short_geo & short_micro & liquid & d['clean'], 'signal'] = -1\n\n"
+        "    # ── PnL ──────────────────────────────────────────────────────────\n"
+        "    d['pnl_pips'] = np.where(\n"
+        "        d['signal'] != 0,\n"
+        "        d['signal'] * d['fwd_ret_pips'] - spread,\n"
+        "        np.nan\n"
+        "    )\n"
+        "    return d\n\n"
+        "df_result = apply_system1(df_all)\n"
+        "trades = df_result[df_result['signal'] != 0].copy()\n"
+        "print(f'Total signals: {len(trades):,}')\n"
+        "print(f'  Long:  {(trades[\"signal\"]==1).sum():,}')\n"
+        "print(f'  Short: {(trades[\"signal\"]==-1).sum():,}')\n"
+        "print(f'Trades/month: {len(trades) / ((df_all.index.max()-df_all.index.min()).days/30):.1f}')\n"
+    )
+})
+
+cells.append({
+    "cell_type": "markdown", "metadata": {},
+    "source": "## 4. Results"
+})
+
+cells.append({
+    "cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+    "source": (
+        "pnl = trades['pnl_pips'].dropna()\n"
+        "wins = pnl[pnl > 0]\n"
+        "losses = pnl[pnl <= 0]\n\n"
+        "print('=' * 55)\n"
+        "print('SYSTEM 1 — FULL HISTORY RESULTS')\n"
+        "print('=' * 55)\n"
+        "print(f'Period:        {df_all.index.min().date()} -> {df_all.index.max().date()}')\n"
+        "print(f'Trades:        {len(pnl):,}')\n"
+        "print(f'Trades/month:  {len(pnl)/((df_all.index.max()-df_all.index.min()).days/30):.1f}')\n"
+        "print(f'Win rate:      {(pnl>0).mean():.1%}')\n"
+        "print(f'Avg win:       {wins.mean():.1f} pips')\n"
+        "print(f'Avg loss:      {losses.mean():.1f} pips')\n"
+        "print(f'Median PnL:    {pnl.median():.1f} pips')\n"
+        "print(f'EV/trade:      {pnl.mean():.1f} pips')\n"
+        "print(f'Profit factor: {wins.sum()/abs(losses.sum()):.2f}')\n"
+        "print(f'Total PnL:     {pnl.sum():.0f} pips')\n"
+        "sharpe = (pnl.mean()/pnl.std()) * np.sqrt(252*24/HOLD_H) if pnl.std()>0 else 0\n"
+        "print(f'Sharpe:        {sharpe:.2f}')\n\n"
+        "print()\n"
+        "# Last 18 months\n"
+        "cutoff_18m = df_all.index.max() - pd.DateOffset(months=18)\n"
+        "recent = trades[trades.index >= cutoff_18m]['pnl_pips'].dropna()\n"
+        "if len(recent) > 10:\n"
+        "    print(f'--- Last 18 months ({cutoff_18m.date()} -> {df_all.index.max().date()}) ---')\n"
+        "    print(f'Trades:        {len(recent):,}')\n"
+        "    print(f'Win rate:      {(recent>0).mean():.1%}')\n"
+        "    print(f'EV/trade:      {recent.mean():.1f} pips')\n"
+        "    print(f'Total PnL:     {recent.sum():.0f} pips')\n"
+        "    sharpe_r = (recent.mean()/recent.std()) * np.sqrt(252*24/HOLD_H) if recent.std()>0 else 0\n"
+        "    print(f'Sharpe:        {sharpe_r:.2f}')\n\n"
+        "print()\n"
+        "print('Per-pair breakdown (full history):')\n"
+        "print(f'{\"Pair\":<10} {\"Trades\":>8} {\"WinRate\":>9} {\"EV/trade\":>10} {\"Total\":>10} {\"Sharpe\":>8}')\n"
+        "print('-' * 60)\n"
+        "for pair in sorted(trades['pair'].unique()):\n"
+        "    p = trades[trades['pair']==pair]['pnl_pips'].dropna()\n"
+        "    if len(p) < 5: continue\n"
+        "    sh = (p.mean()/p.std())*np.sqrt(252*24/HOLD_H) if p.std()>0 else 0\n"
+        "    flag = ' <<<' if p.mean() > 0 else ''\n"
+        "    print(f'{pair:<10} {len(p):>8,} {(p>0).mean():>8.1%} {p.mean():>10.1f} {p.sum():>10.0f} {sh:>8.2f}{flag}')\n"
+    )
+})
+
+cells.append({
+    "cell_type": "markdown", "metadata": {},
+    "source": "## 5. Hour distribution"
+})
+
+cells.append({
+    "cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+    "source": (
+        "trades['hour'] = trades.index.hour\n"
+        "hourly = trades.groupby('hour')['pnl_pips'].agg(\n"
+        "    trades='count', win_rate=lambda x: (x>0).mean(), ev='mean', total='sum'\n"
+        ").reset_index()\n\n"
+        "print('Trade distribution by hour:')\n"
+        "print(f'{\"Hour\":>6} {\"Trades\":>8} {\"WinRate\":>9} {\"EV/trade\":>10} {\"Total\":>10}')\n"
+        "print('-' * 48)\n"
+        "for _, row in hourly.iterrows():\n"
+        "    flag = ' <<<' if row['ev'] > 0 else ''\n"
+        "    print(f'{int(row[\"hour\"]):>6} {int(row[\"trades\"]):>8,} {row[\"win_rate\"]:>8.1%} {row[\"ev\"]:>10.1f} {row[\"total\"]:>10.0f}{flag}')\n"
+        "print(f'\\nTrade count std across hours: {hourly[\"trades\"].std():.1f} (lower = more uniform)')\n"
+    )
+})
+
+cells.append({
+    "cell_type": "markdown", "metadata": {},
+    "source": "## 6. Equity curves"
+})
+
+cells.append({
+    "cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+    "source": (
+        "fig, axes = plt.subplots(2, 2, figsize=(16, 10))\n"
+        "fig.patch.set_facecolor('#080c14')\n"
+        "for ax in axes.flatten():\n"
+        "    ax.set_facecolor('#080c14')\n"
+        "    ax.tick_params(colors='white')\n"
+        "    for spine in ax.spines.values(): spine.set_edgecolor('#1a2332')\n\n"
+        "# Full history equity\n"
+        "cum = trades.sort_index()['pnl_pips'].cumsum()\n"
+        "axes[0,0].plot(cum.index, cum.values, color='#4fc3f7', linewidth=1.5)\n"
+        "axes[0,0].axhline(0, color='white', alpha=0.2)\n"
+        "axes[0,0].set_title(f'Full history — {len(trades):,} trades', color='white')\n"
+        "axes[0,0].set_ylabel('Cumulative pips', color='white')\n\n"
+        "# Per-pair\n"
+        "for pair in sorted(trades['pair'].unique()):\n"
+        "    pp = trades[trades['pair']==pair].sort_index()['pnl_pips'].cumsum()\n"
+        "    axes[0,1].plot(pp.index, pp.values, linewidth=0.8, alpha=0.6, label=pair)\n"
+        "axes[0,1].axhline(0, color='white', alpha=0.2)\n"
+        "axes[0,1].set_title('Per-pair equity', color='white')\n"
+        "axes[0,1].legend(fontsize=6, facecolor='#1a2332', labelcolor='white', ncol=3)\n\n"
+        "# Last 18 months\n"
+        "recent_trades = trades[trades.index >= cutoff_18m]\n"
+        "cum_r = recent_trades.sort_index()['pnl_pips'].cumsum()\n"
+        "axes[1,0].plot(cum_r.index, cum_r.values, color='#2ecc71', linewidth=1.5)\n"
+        "axes[1,0].axhline(0, color='white', alpha=0.2)\n"
+        "axes[1,0].set_title(f'Last 18 months — {len(recent_trades):,} trades', color='white')\n"
+        "axes[1,0].set_ylabel('Cumulative pips', color='white')\n\n"
+        "# Hour distribution\n"
+        "colors = ['#2ecc71' if v > 0 else '#ff4757' for v in hourly['ev']]\n"
+        "axes[1,1].bar(hourly['hour'], hourly['ev'], color=colors, alpha=0.8)\n"
+        "axes[1,1].axhline(0, color='white', alpha=0.3)\n"
+        "axes[1,1].set_title('EV/trade by hour (pips)', color='white')\n"
+        "axes[1,1].set_xlabel('Hour (UTC)', color='white')\n\n"
+        "plt.suptitle('System 1: Trend Continuation in Liquid Hours', color='white', fontsize=13)\n"
+        "plt.tight_layout()\n"
+        "plt.show()\n"
+    )
+})
+
+cells.append({
+    "cell_type": "markdown", "metadata": {},
+    "source": "## 7. Rule contribution analysis\n\nWhich conditions are doing the work? Remove one at a time and see what breaks."
+})
+
+cells.append({
+    "cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+    "source": (
+        "rules = {\n"
+        "    'Full system':          lambda d: d,\n"
+        "    'No slope_agree':       lambda d: d.assign(**{'slope_agree_3_24': 1}),  # always true\n"
+        "    'No slope_24h filter':  lambda d: d.assign(slope_close_24h=1e-6),  # always passes long side\n"
+        "    'No range_pos filter':  lambda d: d.assign(range_pos_24h=0.5),  # neutral\n"
+        "    'No hurst filter':      lambda d: d.assign(hurst_6h=0.6),       # always passes\n"
+        "    'No kyle filter':       lambda d: d.assign(kyle_lambda=lambda x: x['kyle_lambda_ma12']+1e-10),\n"
+        "    'No entropy filter':    lambda d: d.assign(entropy_norm=0.5),   # always passes\n"
+        "    'No session filter':    lambda d: d.assign(is_london=1, is_ny=1),\n"
+        "}\n\n"
+        "print('Rule ablation — what happens when we remove each condition:')\n"
+        "print(f'{\"Variant\":<25} {\"Trades\":>8} {\"WinRate\":>9} {\"EV/trade\":>10} {\"Total\":>10} {\"Sharpe\":>8}')\n"
+        "print('-' * 75)\n\n"
+        "for name, transform in rules.items():\n"
+        "    try:\n"
+        "        res = apply_system1(transform(df_all.copy()))\n"
+        "        t = res[res['signal'] != 0]['pnl_pips'].dropna()\n"
+        "        if len(t) < 5:\n"
+        "            print(f'{name:<25} insufficient trades')\n"
+        "            continue\n"
+        "        sh = (t.mean()/t.std())*np.sqrt(252*24/HOLD_H) if t.std()>0 else 0\n"
+        "        flag = ' <<<' if t.mean() > 0 else ''\n"
+        "        print(f'{name:<25} {len(t):>8,} {(t>0).mean():>8.1%} {t.mean():>10.1f} {t.sum():>10.0f} {sh:>8.2f}{flag}')\n"
+        "    except Exception as e:\n"
+        "        print(f'{name:<25} ERROR: {e}')\n"
+    )
+})
+
+nb = {
+    "nbformat": 4,
+    "nbformat_minor": 4,
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python", "version": "3.13.0"}
+    },
+    "cells": cells
+}
+
+with open('notebooks_10/02_system1_trend_continuation.ipynb', 'w', encoding='utf-8') as f:
+    json.dump(nb, f, ensure_ascii=False, indent=1)
+
+print(f'Written. {len(cells)} cells.')

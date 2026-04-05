@@ -265,5 +265,42 @@ def main():
     print(f'  depth than majors -- these are your binding constraints.')
 
 
+def per_hour_caps(impact_pct=0.01, simultaneous=4):
+    """Return {pair: {hour: max_lots}} for all 24 hours."""
+    caps = {}
+    for pair in PAIRS:
+        daily_total = BIS_DAILY_TOTAL_USD_BN[pair]
+        daily_spot = daily_total * SPOT_FRACTION
+        caps[pair] = {}
+        for h in range(24):
+            pct = get_hourly_pct(pair, h)
+            hourly_vol_usd = daily_spot * pct * 1e9  # in USD
+            ceiling_usd = hourly_vol_usd * impact_pct / simultaneous
+            caps[pair][h] = max(1, int(ceiling_usd / LOT_UNITS))
+    return caps
+
+
+def print_per_hour_caps():
+    caps = per_hour_caps()
+    print('\n' + '=' * 120)
+    print('PER-HOUR CAPACITY CAPS (lots) — 1% impact threshold, 4 simultaneous positions')
+    print('=' * 120)
+    header = f'{"Pair":<10}' + ''.join(f'{h:>6}' for h in range(24))
+    print(header)
+    print('-' * 120)
+    for pair in PAIRS:
+        row = f'{pair:<10}' + ''.join(f'{caps[pair][h]:>6}' for h in range(24))
+        print(row)
+    print()
+
+    # Also print the condensed version suitable for pasting into sim
+    print('CAPACITY_CAPS_BY_HOUR = {')
+    for pair in PAIRS:
+        vals = ', '.join(f'{caps[pair][h]}' for h in range(24))
+        print(f"    '{pair}': [{vals}],")
+    print('}')
+
+
 if __name__ == '__main__':
     main()
+    print_per_hour_caps()
