@@ -1022,13 +1022,13 @@ def simulate_capital(df_all, backtest_start):
     df = df_all[df_all.index >= backtest_start].copy()
     df = df[df['label_1H'].notna()].copy()
 
-    # Dynamic config:
-    # 18-21h UTC: meta P>0.5 + Q50>0.7x spread, OR bypass meta if Q50>1x spread
-    # Outside 18-21h UTC: meta bypassed, only Q50>0.7x spread required
+    # Signal config:
+    # h19-h22 UTC (edge): meta P>0.5 + |Q50|>0.7x spread, OR bypass meta if |Q50|>1x spread
+    # h23-h18 UTC (off-hours): meta bypassed, |Q50|>0.7x spread only
     HIGH_CONV_THRESHOLD = AVG_SPREAD * 1.0
     hour = df.index.hour
-    in_window = (hour >= 18) & (hour <= 21)
-    meta_path = in_window & (df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)
+    in_window = (hour >= 19) & (hour <= 22)
+    meta_path      = in_window & (df['meta_proba'] > META_THRESHOLD) & (df['abs_Q50'] > MIN_Q50_THRESHOLD)
     high_conv_path = in_window & (df['abs_Q50'] > HIGH_CONV_THRESHOLD)
     outside_window = ~in_window & (df['abs_Q50'] > MIN_Q50_THRESHOLD)
     df_signals = df[meta_path | high_conv_path | outside_window].copy()
