@@ -1,117 +1,193 @@
 """
-Model inference v6.0 — 3 LightGBM quantile models (Q25/Q50/Q75)
-+ 1 meta-model binary classifier for trade quality filtering.
+Model inference v7.0 — MFE Q50 LightGBM quantile model + rule-based direction system.
 
-Direction = sign(Q50), trade quality = meta_proba.
-Two-path signal: meta path (P>0.50 + Q50>0.7x spread) OR high conviction bypass (Q50>1.0x spread).
+The MFE model predicts the dominant move (max of up/down excursion) over 72h,
+completely direction-agnostic.  Direction is determined separately by pair-specific
+rule-based thresholds applied on top.
+
+Two outputs per bar:
+  - is_signal : mfe_q50_pips >= MFE_THRESH (70 pips)
+  - direction : +1 LONG / -1 SHORT / NaN if rule has no clear call for this bar
+
+Both are logged regardless — dashboard shows all signals, direction-unconfirmed too.
 """
 
+import numpy as np
 import joblib
+import pandas as pd
 from pathlib import Path
 
 MODELS_DIR = Path("/app/models")
+MFE_THRESH = 70.0   # pips (model output is already in pips)
 
-AVG_SPREAD = 0.00028        # ~2.8 pips average spread
-MIN_Q50_THRESHOLD = AVG_SPREAD * 0.7   # 0.000196
-META_THRESHOLD = 0.50
-HIGH_CONV_THRESHOLD = AVG_SPREAD * 1.0  # 0.00028 — bypass meta if Q50 exceeds this
 
+# ---------------------------------------------------------------------------
+# Direction rules (pair-specific, rule-based — completely separate from MFE)
+# Returns: +1 LONG, -1 SHORT, or NaN (no clear call)
+# ---------------------------------------------------------------------------
+
+def _direction_for_row(pair: str, row: pd.Series) -> float:
+    """Apply pair-specific directional rule to a single feature row."""
+
+    def get(col):
+        v = row.get(col, np.nan)
+        return float(v) if not pd.isna(v) else np.nan
+
+    if pair == 'USDJPY':
+        return -1.0
+
+    if pair == 'AUDUSD':
+        beta   = get('beta_gbpusd_1w')
+        atr_24 = get('atr_24')
+        if (not np.isnan(beta) and beta > 0.775) or (not np.isnan(atr_24) and atr_24 < 40.8):
+            return 1.0
+        return np.nan
+
+    if pair == 'GBPUSD':
+        csi = get('csi_usd_24h')
+        if not np.isnan(csi) and csi < 0.004:
+            return 1.0
+        return np.nan
+
+    if pair == 'EURUSD':
+        corr = get('corr_audusd_24h')
+        if not np.isnan(corr) and corr < 0.22:
+            return 1.0
+        return np.nan
+
+    if pair == 'NZDUSD':
+        dist = get('dist_5d_high')
+        if not np.isnan(dist) and dist > 0.35:
+            return 1.0
+        return np.nan
+
+    if pair == 'USDCHF':
+        corr = get('corr_eurusd_1w')
+        if not np.isnan(corr) and corr > -0.60:
+            return 1.0
+        return np.nan
+
+    if pair == 'CHFJPY':
+        corr = get('corr_usdjpy_1w')
+        if np.isnan(corr):
+            return np.nan
+        if corr > 0.40:
+            return 1.0
+        if corr < 0.26:
+            return -1.0
+        return np.nan
+
+    if pair == 'CADJPY':
+        vt = get('vol_trend')
+        if np.isnan(vt):
+            return np.nan
+        return 1.0 if vt < 1.15 else -1.0
+
+    if pair == 'AUDJPY':
+        beta = get('beta_usdjpy_1w')
+        if not np.isnan(beta) and beta > 0.74:
+            return 1.0
+        return np.nan
+
+    if pair == 'EURJPY':
+        beta = get('beta_eurusd_1w')
+        if not np.isnan(beta) and beta > 0.38:
+            return 1.0
+        return np.nan
+
+    if pair == 'GBPJPY':
+        beta = get('beta_eurusd_1w')
+        if not np.isnan(beta) and beta > 0.50:
+            return 1.0
+        return np.nan
+
+    if pair == 'EURAUD':
+        corr = get('corr_audusd_24h')
+        if not np.isnan(corr) and corr < 0.22:
+            return 1.0
+        return np.nan
+
+    if pair == 'AUDNZD':
+        corr = get('corr_regime_audusd')
+        if not np.isnan(corr) and corr > 0.0:
+            return 1.0
+        return np.nan
+
+    if pair == 'EURGBP':
+        csi = get('csi_usd_24h')
+        if not np.isnan(csi) and csi > 0.004:
+            return -1.0
+        return np.nan
+
+    if pair == 'USDCAD':
+        return np.nan   # no rule defined yet
+
+    return np.nan
+
+
+# ---------------------------------------------------------------------------
+# Predictor
+# ---------------------------------------------------------------------------
 
 class Predictor:
-    """Loads quantile + meta models once, runs inference on demand."""
+    """
+    Loads MFE Q50 model once at startup.  Runs per-pair prediction on demand.
+
+    cross_features must be passed in from outside (computed across all pairs
+    simultaneously) — see _build_cross_features() in paper_trading.py.
+    """
 
     def __init__(self):
-        self.quant_models = {}   # {'Q25': model, 'Q50': model, 'Q75': model}
-        self.meta_model = None
+        self.mfe_model    = None
         self.feature_cols = None
-        self.meta_feature_cols = None
         self._load_models()
 
     def _load_models(self):
-        # Load 3 quantile models
-        for q_name in ['Q25', 'Q50', 'Q75']:
-            q_int = int(q_name[1:])
-            path = MODELS_DIR / f'model_1H_Q{q_int}.joblib'
-            bundle = joblib.load(path)
-            self.quant_models[q_name] = bundle['model']
-            if self.feature_cols is None:
-                self.feature_cols = bundle['feature_cols']
+        path   = MODELS_DIR / 'model_1H_Q50.joblib'
+        bundle = joblib.load(path)
+        self.mfe_model    = bundle['model']
+        self.feature_cols = bundle['feature_cols']
 
-        # Load meta-model
-        meta_path = MODELS_DIR / 'meta_confidence.joblib'
-        meta_bundle = joblib.load(meta_path)
-        self.meta_model = meta_bundle['model']
-        self.meta_feature_cols = meta_bundle['meta_feature_cols']
-
-    def predict(self, features_df, pair: str) -> dict:
+    def predict(self, features_df: pd.DataFrame, pair: str) -> dict:
         """
-        Run inference for one pair: 3 quantile predictions + meta probability.
-
-        Replicates the backtest logic exactly:
-        1. Run Q25/Q50/Q75 on microstructure features
-        2. Build derived columns (Q50_oof, Q25_oof, Q75_oof, abs_Q50, iqr, conf_ratio)
-        3. Run meta-model on microstructure features + derived columns
+        Run MFE prediction + direction rule for one pair.
 
         Args:
-            features_df: DataFrame with microstructure features, at least 1 row.
-                         Uses the last row (most recent hour).
-            pair: e.g. "EURUSD"
+            features_df : DataFrame with all features, at least 1 row.
+                          Must already include momentum/calendar cols
+                          (from live_features_extra) and cross-pair cols.
+                          Uses the LAST row (most recent closed hour).
+            pair        : e.g. 'EURUSD'
 
-        Returns:
-            dict with quantile predictions, direction, meta_proba, and trade signal.
+        Returns dict:
+            pair                  str
+            mfe_q50_pips          float  — predicted dominant move in pips
+            is_signal             bool   — mfe_q50_pips >= 70
+            direction             int|None  — +1 LONG / -1 SHORT / None
+            direction_label       str    — 'LONG' / 'SHORT' / 'NO_RULE'
         """
-        X = features_df[self.feature_cols].ffill().fillna(0)
-        latest = X.iloc[[-1]]
+        # Align features to model columns
+        X = features_df.reindex(columns=self.feature_cols).ffill().fillna(0)
+        latest_row = X.iloc[-1]
 
-        # Run 3 quantile models (no force-sort — matches backtest exactly)
-        q_preds = {}
-        for q_name in ['Q25', 'Q50', 'Q75']:
-            model = self.quant_models[q_name]
-            q_preds[q_name] = float(model.predict(latest)[0])
+        # Model output is already in pips (trained with pip-denominated target)
+        mfe_pips = float(self.mfe_model.predict(latest_row.values.reshape(1, -1))[0])
 
-        q50 = q_preds['Q50']
-        q25 = q_preds['Q25']
-        q75 = q_preds['Q75']
+        # Direction (rule-based, completely separate from MFE model)
+        feat_row  = features_df.iloc[-1]
+        direction = _direction_for_row(pair, feat_row)
 
-        # Direction from sign of Q50
-        if q50 > 0:
-            direction = 'bullish'
-        elif q50 < 0:
-            direction = 'bearish'
+        if np.isnan(direction):
+            dir_int   = None
+            dir_label = 'NO_RULE'
         else:
-            direction = 'neutral'
-
-        abs_q50 = abs(q50)
-        iqr = q75 - q25
-
-        # Build meta-model input: microstructure features + derived quantile columns
-        # This replicates the backtest's run_inference() logic exactly
-        meta_row = latest.copy()
-        meta_row['Q50_oof'] = q50
-        meta_row['Q25_oof'] = q25
-        meta_row['Q75_oof'] = q75
-        meta_row['abs_Q50'] = abs_q50
-        meta_row['iqr'] = iqr
-        meta_row['conf_ratio'] = abs_q50 / max(iqr, 1e-10)
-
-        X_meta = meta_row[self.meta_feature_cols].fillna(0)
-        meta_proba = float(self.meta_model.predict_proba(X_meta)[0, 1])
-
-        # Two-path signal (matches simulation config exactly):
-        # Path 1 (meta): meta_proba > 0.50 AND |Q50| > 0.7x spread
-        # Path 2 (bypass): |Q50| > 1.0x spread — fires regardless of meta
-        meta_path = meta_proba > META_THRESHOLD and abs_q50 > MIN_Q50_THRESHOLD
-        high_conv_path = abs_q50 > HIGH_CONV_THRESHOLD
-        is_tradeable = meta_path or high_conv_path
+            dir_int   = int(direction)
+            dir_label = 'LONG' if dir_int == 1 else 'SHORT'
 
         return {
-            'pair': pair,
-            'direction': direction,
-            'q25': round(q25, 8),
-            'q50': round(q50, 8),
-            'q75': round(q75, 8),
-            'meta_proba': round(meta_proba, 4),
-            'is_tradeable': is_tradeable,
-            'abs_q50': round(abs_q50, 8),
-            'spread': round(iqr, 8),
+            'pair':            pair,
+            'mfe_q50_pips':    round(mfe_pips, 1),
+            'is_signal':       mfe_pips >= MFE_THRESH,
+            'direction':       dir_int,
+            'direction_label': dir_label,
         }

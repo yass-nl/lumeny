@@ -63,7 +63,7 @@ export default function RiskDisclosure() {
             marginBottom: 64,
           }}
         >
-          Last updated: March 2026
+          Last updated: April 2026
         </p>
 
         <div
@@ -93,10 +93,11 @@ export default function RiskDisclosure() {
         <div style={sectionStyle}>
           <h2 style={headingStyle}>1. Nature of Our Services</h2>
           <p style={textStyle}>
-            LumenY provides quantitative, model-generated directional signals
-            for foreign exchange (FX) markets. These signals are strictly
-            informational and represent statistical probabilities derived from
-            our proprietary models. They are not, and should not be construed
+            LumenY provides quantitative, model-generated FX signals in the
+            form of Maximum Favorable Excursion forecasts enriched with macro
+            bias insights. These signals are strictly informational and
+            represent statistical probabilities derived from our proprietary
+            models. They are not, and should not be construed
             as, financial advice, investment recommendations, or solicitations
             to trade.
           </p>

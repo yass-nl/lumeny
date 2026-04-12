@@ -1,0 +1,140 @@
+Loading models...
+  mfe_q50_8h : 308 features, 1801 iters, cv_pinball=7.779
+  mfe_q50    : 320 features, 423 iters, cv_pinball=8.150
+  Extra vol features in mfe_q50: ['atr_24', 'atr_6', 'atr_72', 'atr_ratio_6_24', 'atr_ratio_6_72', 'range_width_24', 'range_width_48', 'range_width_5d', 'rv_zscore_24', 'vol_regime_10d', 'vol_regime_5d', 'vol_trend']
+  Cooldown: 8h per pair | Horizons evaluated: [8, 24, 72]h
+
+Scoring pairs on test set...
+  EURUSD: 9,288 rows scored
+  GBPUSD: 9,274 rows scored
+  USDJPY: 9,292 rows scored
+  USDCHF: 9,275 rows scored
+  AUDUSD: 9,200 rows scored
+  USDCAD: 9,313 rows scored
+  NZDUSD: 9,309 rows scored
+  EURJPY: 9,200 rows scored
+  GBPJPY: 9,207 rows scored
+  EURGBP: 9,318 rows scored
+  EURAUD: 9,317 rows scored
+  AUDJPY: 9,318 rows scored
+  CADJPY: 9,318 rows scored
+  CHFJPY: 9,315 rows scored
+  AUDNZD: 9,318 rows scored
+
+Total test rows scored: 54,367
+Test period: 2024-07-01 -> 2025-12-22
+
+Applying cooldown and collecting signals...
+
+================================================================================
+  THRESHOLD >= 50p  |  test period ~18 months  |  cooldown=8h
+================================================================================
+
+--- Signal counts ---
+  mfe_q50_8h only :   807  (45.5/mo)
+  mfe_q50 only    : 1,875  (105.8/mo)
+  Both fire       :   141  (8.0/mo)
+  Overlap: 14.9% of 8h signals also fired by q50 | 7.0% of q50 signals also fired by 8h
+
+--- Signal quality (actual MFE at 8h / 24h / 72h horizons) ---
+  8h only              N= 807  pred_8h= +58.2p  pred_q50= +77.8p
+    [ 8h] best= +117.9p  long= +45.6p  short= +98.4p  hit>=50p:72.1%
+    [24h] best= +193.0p  long= +78.7p  short=+161.6p  hit>=50p:90.8%
+    [72h] best= +344.9p  long=+133.2p  short=+295.6p  hit>=50p:98.6%
+  q50 only             N=1875  pred_8h= +44.1p  pred_q50= +71.7p
+    [ 8h] best=  +84.6p  long= +40.3p  short= +65.9p  hit>=50p:61.5%
+    [24h] best= +159.8p  long= +69.5p  short=+130.5p  hit>=50p:93.1%
+    [72h] best= +303.9p  long=+124.6p  short=+251.8p  hit>=50p:99.6%
+  both                 N= 141  pred_8h= +62.5p  pred_q50= +84.9p
+    [ 8h] best= +106.8p  long= +69.8p  short= +52.5p  hit>=50p:80.9%
+    [24h] best= +172.2p  long=+102.6p  short=+103.7p  hit>=50p:96.5%
+    [72h] best= +302.9p  long=+149.5p  short=+220.2p  hit>=50p:99.3%
+
+  Pred correlation on joint bars: 0.532
+
+--- Per-pair signal split (>= 50p) ---
+  Pair        8h_only  q50_only   both  total_8h  total_q50  overlap_8h
+  ----------------------------------------------------------------------
+  AUDJPY           30       120     10        40        130  25%
+  AUDNZD          153       139      6       159        145  4%
+  AUDUSD            3        11      4         7         15  57%
+  CADJPY           47       148      2        49        150  4%
+  CHFJPY          254       361     39       293        400  13%
+  EURAUD           64       257      8        72        265  11%
+  EURGBP           16         9      8        24         17  33%
+  EURJPY           67       190     23        90        213  26%
+  EURUSD            3        27      0         3         27  0%
+  GBPJPY          128       299     20       148        319  14%
+  GBPUSD            0        40      0         0         40  0%
+  NZDUSD            9        33      4        13         37  31%
+  USDCAD            3        71      3         6         74  50%
+  USDCHF            3        15      1         4         16  25%
+  USDJPY           27       155     13        40        168  32%
+
+--- Year-by-year hit rates (>= 50p) ---
+  Year 2024  8h_N= 471  q50_N= 956  both_N= 71
+    [ 8h]  8h_hit=79.2%  q50_hit=64.3%
+    [24h]  8h_hit=94.9%  q50_hit=93.4%
+    [72h]  8h_hit=98.9%  q50_hit=99.2%
+  Year 2025  8h_N= 477  q50_N=1060  both_N= 70
+    [ 8h]  8h_hit=67.7%  q50_hit=61.6%
+    [24h]  8h_hit=88.5%  q50_hit=93.2%
+    [72h]  8h_hit=98.5%  q50_hit=100.0%
+
+================================================================================
+  THRESHOLD >= 70p  |  test period ~18 months  |  cooldown=8h
+================================================================================
+
+--- Signal counts ---
+  mfe_q50_8h only :   202  (11.4/mo)
+  mfe_q50 only    :   768  (43.3/mo)
+  Both fire       :    68  (3.8/mo)
+  Overlap: 25.2% of 8h signals also fired by q50 | 8.1% of q50 signals also fired by 8h
+
+--- Signal quality (actual MFE at 8h / 24h / 72h horizons) ---
+  8h only              N= 202  pred_8h= +78.4p  pred_q50= +94.5p
+    [ 8h] best= +161.3p  long= +53.9p  short=+132.9p  hit>=70p:56.9%
+    [24h] best= +221.7p  long= +91.9p  short=+176.0p  hit>=70p:84.2%
+    [72h] best= +355.8p  long=+143.3p  short=+290.7p  hit>=70p:99.5%
+  q50 only             N= 768  pred_8h= +50.0p  pred_q50= +93.8p
+    [ 8h] best= +100.8p  long= +46.2p  short= +78.7p  hit>=70p:46.2%
+    [24h] best= +187.3p  long= +76.1p  short=+153.8p  hit>=70p:85.7%
+    [72h] best= +358.2p  long=+127.5p  short=+309.2p  hit>=70p:97.5%
+  both                 N=  68  pred_8h= +88.4p  pred_q50=+127.6p
+    [ 8h] best= +281.0p  long=+122.3p  short=+180.2p  hit>=70p:89.7%
+    [24h] best= +422.8p  long=+184.6p  short=+309.0p  hit>=70p:95.6%
+    [72h] best= +593.6p  long=+252.8p  short=+478.9p  hit>=70p:100.0%
+
+  Pred correlation on joint bars: 0.348
+
+--- Per-pair signal split (>= 70p) ---
+  Pair        8h_only  q50_only   both  total_8h  total_q50  overlap_8h
+  ----------------------------------------------------------------------
+  AUDJPY            2        37     12        14         49  86%
+  AUDNZD           21        54      5        26         59  19%
+  AUDUSD            1         7      2         3          9  67%
+  CADJPY            6        72      5        11         77  45%
+  CHFJPY          136       190     25       161        215  16%
+  EURAUD            5        82      5        10         87  50%
+  EURGBP            6         1      2         8          3  25%
+  EURJPY           12        69      0        12         69  0%
+  EURUSD            0         5      0         0          5  0%
+  GBPJPY           11       144      3        14        147  21%
+  GBPUSD            0         5      0         0          5  0%
+  NZDUSD            2        21      3         5         24  60%
+  USDCAD            0        41      1         1         42  100%
+  USDCHF            0         7      0         0          7  0%
+  USDJPY            0        33      5         5         38  100%
+
+--- Year-by-year hit rates (>= 70p) ---
+  Year 2024  8h_N= 138  q50_N= 460  both_N= 52
+    [ 8h]  8h_hit=81.9%  q50_hit=51.3%
+    [24h]  8h_hit=92.0%  q50_hit=86.7%
+    [72h]  8h_hit=99.3%  q50_hit=96.7%
+  Year 2025  8h_N= 132  q50_N= 376  both_N= 16
+    [ 8h]  8h_hit=47.7%  q50_hit=47.9%
+    [24h]  8h_hit=81.8%  q50_hit=86.2%
+    [72h]  8h_hit=100.0%  q50_hit=98.9%
+
+================================================================================
+Done.

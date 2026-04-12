@@ -63,14 +63,14 @@ export default function TermsOfService() {
             marginBottom: 64,
           }}
         >
-          Last updated: March 2026
+          Last updated: April 2026
         </p>
 
         <div style={sectionStyle}>
           <h2 style={headingStyle}>1. Overview</h2>
           <p style={textStyle}>
             These Terms of Service ("Terms") govern your access to and use of
-            the LumenY website (lumen-y.com) and any signal services provided
+            the LumenY website (lumen-y.com) and any services provided
             by LumenY ("we", "our", "us"). By accessing our website or using
             our services, you agree to be bound by these Terms.
           </p>
@@ -79,44 +79,46 @@ export default function TermsOfService() {
         <div style={sectionStyle}>
           <h2 style={headingStyle}>2. Nature of Services</h2>
           <p style={textStyle}>
-            LumenY provides quantitative directional signals and related
-            informational content for foreign exchange (FX) markets. Our
-            services are strictly informational in nature. We do not provide
-            financial advice, investment advice, or portfolio management
-            services. We do not manage, hold, or have access to client funds
-            or trading accounts.
+            LumenY provides quantitative FX intelligence in the form of
+            Maximum Favorable Excursion (MFE) forecasts enriched with macro
+            bias insights. Our services are strictly informational in nature.
+            We do not provide financial advice, investment advice, or portfolio
+            management services. We do not manage, hold, or have access to
+            client funds or trading accounts.
           </p>
           <p style={textStyle}>
-            Our signals represent quantitative, model-generated outputs
-            reflecting directional probabilities. They are not recommendations
-            to buy, sell, or hold any financial instrument.
+            Our forecasts represent quantitative, model-generated outputs
+            reflecting probabilistic price excursion ranges over a defined
+            horizon. They are not recommendations to buy, sell, or hold
+            any financial instrument.
           </p>
         </div>
 
         <div style={sectionStyle}>
           <h2 style={headingStyle}>3. Client Responsibility</h2>
           <p style={textStyle}>
-            You are solely responsible for any and all trading decisions made
-            using LumenY signals. You acknowledge that trading foreign exchange
+            You are solely responsible for any and all decisions made using
+            LumenY forecasts. You acknowledge that trading foreign exchange
             carries significant risk, including the potential loss of your
             entire investment. You are responsible for conducting your own
-            due diligence and for ensuring that any use of our signals
-            complies with applicable laws and regulations in your jurisdiction.
+            due diligence and for ensuring that any use of our intelligence
+            output complies with applicable laws and regulations in your
+            jurisdiction.
           </p>
           <p style={textStyle}>
             You agree that LumenY bears no responsibility for any financial
             losses, damages, or other consequences arising from your use of
-            our signals, whether directly or indirectly.
+            our forecasts, whether directly or indirectly.
           </p>
         </div>
 
         <div style={sectionStyle}>
           <h2 style={headingStyle}>4. No Guarantee of Performance</h2>
           <p style={textStyle}>
-            Past performance, including any test results or historical metrics
+            Past performance, including any evaluation results or historical metrics
             presented on our website, is not indicative of future results. We
             make no guarantees, representations, or warranties regarding the
-            accuracy, reliability, or profitability of our signals. Market
+            accuracy, reliability, or usefulness of our forecasts. Market
             conditions are inherently unpredictable and can change rapidly.
           </p>
         </div>
@@ -125,10 +127,10 @@ export default function TermsOfService() {
           <h2 style={headingStyle}>5. Intellectual Property</h2>
           <p style={textStyle}>
             All content on this website, including but not limited to text,
-            graphics, logos, data, models, methodologies, and signal outputs,
+            graphics, logos, data, models, methodologies, and forecast outputs,
             is the intellectual property of LumenY. You may not reproduce,
             distribute, modify, or create derivative works from any content
-            without our prior written consent. Signal data provided to
+            without our prior written consent. Forecast data provided to
             clients is licensed for the client's internal use only and may
             not be redistributed.
           </p>
@@ -137,7 +139,7 @@ export default function TermsOfService() {
         <div style={sectionStyle}>
           <h2 style={headingStyle}>6. Confidentiality</h2>
           <p style={textStyle}>
-            Any signal data, research, or proprietary information shared with
+            Any forecast data, research, or proprietary information shared with
             clients is confidential. You agree not to disclose, share, or
             redistribute any such information to third parties without our
             prior written consent.

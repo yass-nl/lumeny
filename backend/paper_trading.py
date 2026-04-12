@@ -1,11 +1,13 @@
 """
-LumenY -- Paper Trading Tracker v5.1
+LumenY -- Signal Tracker v7.0
 
-Single horizon (2H forward), per-pair cooldown, meta-model filtering.
+MFE model (Q50 >= 70 pips) + rule-based direction system.
+Informational system: fires when a big move is likely, tells direction.
+No automated order execution.
 
 Two jobs:
-  1. log_predictions()  -- runs every hour, logs model predictions to SQLite
-  2. resolve_outcomes() -- runs every hour, checks past predictions and records actual outcomes
+  1. log_predictions()  -- runs every hour 7-20 UTC, logs model output to SQLite
+  2. resolve_outcomes() -- runs every hour, checks past signals and records actual MFE
 
 Usage:
   python paper_trading.py setup    -- create DB tables
@@ -19,10 +21,13 @@ import argparse
 import asyncio
 import logging
 import os
+import smtplib
 import sqlite3
 import time
 import warnings
 from datetime import datetime, timezone, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 
 import numpy as np
@@ -32,10 +37,10 @@ warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
 # -- Paths --
 
-BACKEND_DIR  = Path(__file__).parent
-VOLUME_DIR   = Path(os.environ.get('VOLUME_PATH', str(BACKEND_DIR)))
-DB_PATH      = VOLUME_DIR / 'paper_trading.db'
-LOG_PATH     = BACKEND_DIR / 'paper_trading.log'
+BACKEND_DIR = Path(__file__).parent
+VOLUME_DIR  = Path(os.environ.get('VOLUME_PATH', str(BACKEND_DIR)))
+DB_PATH     = VOLUME_DIR / 'paper_trading.db'
+LOG_PATH    = BACKEND_DIR / 'paper_trading.log'
 
 # -- Logging --
 
@@ -51,15 +56,20 @@ logger = logging.getLogger(__name__)
 
 # -- Constants --
 
-# Entry = 1H close at prediction time (bar T).
-# Exit  = 1H close 3 hours later (bar T+3).
-# matures_at = last_candle_time + 4H (so resolve fires after exit bar closes).
-MATURITY_HOURS = 4
+# MFE signal threshold (pips)
+MFE_THRESH = 70.0
 
-# Per-pair cooldown: once a trade is logged for a pair, skip that pair for 3 hours.
-COOLDOWN_HOURS = 3
 
-AVG_SPREAD = 0.00028
+# Cooldown: once a signal fires for a pair, skip it for 72 trading hours
+COOLDOWN_HOURS = 72
+
+# Maturity: resolve 72h after signal bar closes + 1h buffer
+MATURITY_HOURS = 73
+
+# Email config (Gmail SMTP) — set via environment variables
+EMAIL_FROM     = os.environ.get('EMAIL_FROM', '')
+EMAIL_PASSWORD = os.environ.get('EMAIL_APP_PASSWORD', '')
+EMAIL_TO       = os.environ.get('EMAIL_TO', EMAIL_FROM)
 
 
 # -- Database --
@@ -75,35 +85,36 @@ def setup_db():
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS predictions (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            logged_at        TEXT NOT NULL,
-            pair             TEXT NOT NULL,
-            direction        TEXT NOT NULL,
-            q25              REAL NOT NULL,
-            q50              REAL NOT NULL,
-            q75              REAL NOT NULL,
-            meta_proba       REAL NOT NULL,
-            is_tradeable     INTEGER NOT NULL,
-            entry_price      REAL,
-            matures_at       TEXT NOT NULL,
-            resolved_at      TEXT,
-            exit_price       REAL,
-            actual_return    REAL,
-            correct          INTEGER,
-            notes            TEXT
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at           TEXT NOT NULL,
+            pair                TEXT NOT NULL,
+            mfe_q50_pips        REAL NOT NULL,
+            is_signal           INTEGER NOT NULL,
+            direction           INTEGER,
+            direction_label     TEXT,
+            entry_price         REAL,
+            matures_at          TEXT NOT NULL,
+            resolved_at         TEXT,
+            actual_mfe_pips     REAL,
+            actual_mae_pips     REAL,
+            fwd_72h_pips        REAL,
+            correct             INTEGER,
+            notes               TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_matures_at ON predictions(matures_at);
         CREATE INDEX IF NOT EXISTS idx_pair       ON predictions(pair);
         CREATE INDEX IF NOT EXISTS idx_resolved   ON predictions(resolved_at);
         CREATE INDEX IF NOT EXISTS idx_logged_at  ON predictions(logged_at);
+        CREATE INDEX IF NOT EXISTS idx_is_signal  ON predictions(is_signal);
 
         CREATE TABLE IF NOT EXISTS hourly_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            logged_at   TEXT NOT NULL,
-            pairs_logged INTEGER NOT NULL,
+            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at              TEXT NOT NULL,
+            pairs_logged           INTEGER NOT NULL,
+            signals_fired          INTEGER NOT NULL DEFAULT 0,
             pairs_skipped_cooldown INTEGER NOT NULL DEFAULT 0,
-            errors      TEXT
+            errors                 TEXT
         );
     """)
     conn.commit()
@@ -114,13 +125,130 @@ def setup_db():
 # -- Cooldown tracking --
 
 def _get_cooldown_pairs(conn, now: datetime) -> set:
-    """Return pairs that have a trade logged within the last COOLDOWN_HOURS."""
+    """Return pairs that have a signal logged within the last COOLDOWN_HOURS."""
     cutoff = (now - timedelta(hours=COOLDOWN_HOURS)).isoformat()
     rows = conn.execute("""
         SELECT DISTINCT pair FROM predictions
-        WHERE is_tradeable = 1 AND logged_at > ?
+        WHERE is_signal = 1 AND logged_at > ?
     """, (cutoff,)).fetchall()
     return {row['pair'] for row in rows}
+
+
+# -- Email notifications --
+
+def send_signal_email(signals: list[dict]):
+    """Send email notification when new signals fire. Silently skips if not configured."""
+    if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
+        return
+    if not signals:
+        return
+
+    try:
+        subject = f"LumenY Signal{'s' if len(signals) > 1 else ''}: {', '.join(s['pair'] for s in signals)}"
+
+        lines = ["=== LumenY Signal Alert ===\n"]
+        for s in signals:
+            dir_str  = s.get('direction_label', 'NO_RULE')
+            mfe      = s.get('mfe_q50_pips', 0)
+            price    = s.get('entry_price', 0)
+            logged   = s.get('logged_at', '')[:16]
+            matures  = s.get('matures_at', '')[:16]
+            lines.append(f"Pair       : {s['pair']}")
+            lines.append(f"MFE Q50    : {mfe:.1f} pips")
+            lines.append(f"Direction  : {dir_str}")
+            lines.append(f"Entry price: {price}")
+            lines.append(f"Signal time: {logged} UTC")
+            lines.append(f"Window ends: {matures} UTC")
+            lines.append("")
+
+        body = "\n".join(lines)
+
+        msg = MIMEMultipart()
+        msg['From']    = EMAIL_FROM
+        msg['To']      = EMAIL_TO
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+
+        logger.info(f'Signal email sent for {[s["pair"] for s in signals]}')
+
+    except Exception as e:
+        logger.warning(f'Email send failed: {e}')
+
+
+# -- Cross-pair feature computation (needed by inference) --
+
+CURRENCY_SIGN = {
+    'EURUSD': {'EUR': +1, 'USD': -1}, 'GBPUSD': {'GBP': +1, 'USD': -1},
+    'USDJPY': {'USD': +1, 'JPY': -1}, 'USDCHF': {'USD': +1, 'CHF': -1},
+    'AUDUSD': {'AUD': +1, 'USD': -1}, 'USDCAD': {'USD': +1, 'CAD': -1},
+    'NZDUSD': {'NZD': +1, 'USD': -1}, 'EURJPY': {'EUR': +1, 'JPY': -1},
+    'GBPJPY': {'GBP': +1, 'JPY': -1}, 'EURGBP': {'EUR': +1, 'GBP': -1},
+    'EURAUD': {'EUR': +1, 'AUD': -1}, 'AUDJPY': {'AUD': +1, 'JPY': -1},
+    'CADJPY': {'CAD': +1, 'JPY': -1}, 'CHFJPY': {'CHF': +1, 'JPY': -1},
+    'AUDNZD': {'AUD': +1, 'NZD': -1},
+}
+PAIRS = list(CURRENCY_SIGN.keys())
+
+
+def _build_cross_features(close_1h_all: dict) -> dict:
+    """
+    Compute cross-pair features (CSI, correlation, beta, relstr) per pair.
+    Returns {pair: DataFrame indexed like close_1h_all[pair]}.
+    Mirrors test_live_full.py::compute_all_cross_pair_features().
+    """
+    returns_all = {p: np.log(c / c.shift(1)) for p, c in close_1h_all.items()}
+    returns_df  = pd.DataFrame(returns_all)
+
+    currencies = ['EUR', 'USD', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD', 'CHF']
+    csi = {}
+    for ccy in currencies:
+        comps = [CURRENCY_SIGN[p][ccy] * returns_df[p]
+                 for p in PAIRS if ccy in CURRENCY_SIGN.get(p, {}) and p in returns_df]
+        if comps:
+            csi[f'csi_{ccy.lower()}'] = pd.concat(comps, axis=1).mean(axis=1)
+    csi_df = pd.DataFrame(csi)
+    csi_rolling = {}
+    for col in csi_df.columns:
+        csi_rolling[f'{col}_24h'] = csi_df[col].rolling(24,  min_periods=8).sum()
+        csi_rolling[f'{col}_72h'] = csi_df[col].rolling(72, min_periods=24).sum()
+    csi_rolling_df = pd.DataFrame(csi_rolling)
+
+    result = {}
+    for pair in PAIRS:
+        if pair not in returns_df.columns:
+            continue
+        r      = returns_df[pair]
+        c_pair = close_1h_all[pair]
+        cols   = {}
+        for peer in [p for p in PAIRS if p != pair]:
+            if peer not in returns_df.columns:
+                continue
+            p_ret  = returns_df[peer]
+            c_peer = close_1h_all[peer]
+            sl     = peer.lower()
+            for w, lbl in [(24, '24h'), (72, '3d'), (168, '1w')]:
+                cols[f'corr_{sl}_{lbl}'] = r.rolling(w, min_periods=w//2).corr(p_ret)
+            cols[f'corr_regime_{sl}'] = cols[f'corr_{sl}_24h'] - cols[f'corr_{sl}_1w']
+            for w, lbl in [(24, '24h'), (168, '1w')]:
+                cov = r.rolling(w, min_periods=w//2).cov(p_ret)
+                var = p_ret.rolling(w, min_periods=w//2).var().clip(lower=1e-12)
+                cols[f'beta_{sl}_{lbl}'] = cov / var
+            cols[f'relstr_{sl}_1h']  = r - p_ret
+            cols[f'relstr_{sl}_4h']  = np.log(c_pair / c_pair.shift(4))  - np.log(c_peer / c_peer.shift(4))
+            cols[f'relstr_{sl}_24h'] = np.log(c_pair / c_pair.shift(24)) - np.log(c_peer / c_peer.shift(24))
+            cols[f'peer_{sl}_ret_1h']  = p_ret
+            cols[f'peer_{sl}_ret_4h']  = np.log(c_peer / c_peer.shift(4))
+            cols[f'peer_{sl}_ret_24h'] = np.log(c_peer / c_peer.shift(24))
+        for col in csi_df.columns:
+            cols[col]          = csi_df[col]
+            cols[f'{col}_24h'] = csi_rolling_df[f'{col}_24h']
+            cols[f'{col}_72h'] = csi_rolling_df[f'{col}_72h']
+        result[pair] = pd.DataFrame(cols, index=r.index).astype(np.float32)
+    return result
 
 
 # -- Inference --
@@ -141,68 +269,86 @@ async def _init_buffer():
 
 def _run_inference_sync(buf) -> tuple[dict, dict]:
     """
-    Run inference for all pairs using an existing CandleBuffer.
-    Returns (predictions_by_pair, prices_by_pair)
+    Run MFE + direction inference for all pairs.
+    Returns (predictions_by_pair, prices_by_pair).
     """
     import sys
     sys.path.insert(0, str(BACKEND_DIR))
 
-    from data_service import PAIRS
     from inference import Predictor
     from features import compute_features_for_pair
+    from live_features_extra import compute_momentum_calendar_features
 
     predictor = Predictor()
 
+    # 1. Gather 1H closes for cross-pair computation
+    close_1h_all = {}
+    for pair in PAIRS:
+        ohlcv = buf.get_ohlcv(pair)
+        if ohlcv and '1H' in ohlcv and not ohlcv['1H'].empty:
+            close_1h_all[pair] = ohlcv['1H']['close']
+
+    cross_features = _build_cross_features(close_1h_all) if close_1h_all else {}
+
     predictions = {}
-    prices = {}
+    prices      = {}
 
     for pair in PAIRS:
         try:
             ohlcv = buf.get_ohlcv(pair)
+            if not ohlcv:
+                continue
 
-            # Need 1m, 5m, 15m for microstructure features
             if '1m' not in ohlcv or '5m' not in ohlcv or '15m' not in ohlcv:
                 logger.warning(f'Missing sub-hourly data for {pair}')
                 continue
 
-            df_1m = ohlcv['1m']
-            df_5m = ohlcv['5m']
+            df_1m  = ohlcv['1m']
+            df_5m  = ohlcv['5m']
             df_15m = ohlcv['15m']
-            df_1h = ohlcv.get('1H')
+            df_1h  = ohlcv.get('1H')
 
-            if len(df_1m) < 120:  # need at least ~2 hours of 1m data
+            if len(df_1m) < 120:
                 logger.warning(f'Insufficient 1m data for {pair}: {len(df_1m)} bars')
                 continue
 
-            # Note: data_service.py already filters out incomplete bars,
-            # so no additional drop needed here.
-
-            # Compute microstructure + contextual features
+            # Base microstructure + contextual features
             features_df = compute_features_for_pair(pair, df_1m, df_5m, df_15m, df_1h)
-
             if features_df.empty:
                 logger.warning(f'Empty features for {pair}')
                 continue
+
+            # Momentum / calendar features (vol_trend, dist_5d_high, etc.)
+            if df_1h is not None and not df_1h.empty:
+                from features import PIP_SIZE
+                df_extra = compute_momentum_calendar_features(df_1h, PIP_SIZE[pair])
+                features_df = features_df.join(df_extra.reindex(features_df.index), how='left')
+
+            # Cross-pair features
+            if pair in cross_features:
+                features_df = features_df.join(
+                    cross_features[pair].reindex(features_df.index), how='left'
+                )
+
+            features_df['pair'] = pair
 
             result = predictor.predict(features_df, pair)
             predictions[pair] = result
 
             # Entry price = close of last complete 1H candle
-            if '1H' in ohlcv and not ohlcv['1H'].empty:
-                latest_close = float(ohlcv['1H']['close'].iloc[-1])
+            if df_1h is not None and not df_1h.empty:
+                prices[pair] = float(df_1h['close'].iloc[-1])
             else:
-                # Fallback: use last 1m close
-                latest_close = float(df_1m['close'].iloc[-1])
-            prices[pair] = latest_close
+                prices[pair] = float(df_1m['close'].iloc[-1])
 
         except Exception as e:
             logger.error(f'Inference error for {pair}: {e}', exc_info=True)
 
+    logger.info(f'Inference complete: {len(predictions)}/{len(PAIRS)} pairs succeeded')
     return predictions, prices
 
 
 async def _run_inference(buf) -> tuple[dict, dict]:
-    """Run inference in a thread so it doesn't block the event loop."""
     return await asyncio.to_thread(_run_inference_sync, buf)
 
 
@@ -212,40 +358,24 @@ async def log_predictions(buf):
     """Fetch predictions for all pairs and log them to the database."""
     now = datetime.now(timezone.utc)
 
-    # Skip during weekend market closure
-    # Also skip Friday evening when maturity would land in the weekend gap.
-    # FX closes ~Fri 22:00 UTC, reopens ~Sun 21:05 UTC.
-    # Start at Sunday 22:02 to ensure the 21:00 bar has fully formed.
-    if now.weekday() == 5 or (now.weekday() == 6 and now.hour < 22):
-        logger.info('Market closed (weekend) -- skipping inference.')
-        return 0
-    # On Friday, skip if the exit candle would not fully close before market
-    # closes (~22:00 UTC). Maturity = last_candle + 3H, exit bar closes at
-    # matures_at, so we need matures_at <= Fri 22:00.  Simpler: skip if
-    # now + MATURITY_HOURS lands on Sat/Sun OR on Friday >= 22:00.
-    if now.weekday() == 4:
-        maturity_approx = now + timedelta(hours=MATURITY_HOURS)
-        if maturity_approx.weekday() in (5, 6) or (maturity_approx.weekday() == 4 and maturity_approx.hour >= 22):
-            logger.info('Friday late session -- exit candle would land after market close, skipping inference.')
-            return 0
-
     logger.info('Running inference...')
     predictions, prices = await _run_inference(buf)
 
-    now = datetime.now(timezone.utc)
+    now  = datetime.now(timezone.utc)
     conn = get_db()
-    logged = 0
+    logged           = 0
+    signals_fired    = 0
     skipped_cooldown = 0
-    errors = []
-    last_candle_time = now  # fallback if predictions is empty
+    errors           = []
+    last_candle_time = now
 
-    # Get pairs on cooldown
     cooldown_pairs = _get_cooldown_pairs(conn, now)
+    new_signals    = []
 
     for pair, result in predictions.items():
         entry_price = prices.get(pair)
 
-        # Get the timestamp of the last complete 1H candle
+        # Get timestamp of last complete 1H candle
         ohlcv = buf.get_ohlcv(pair)
         if ohlcv and '1H' in ohlcv and not ohlcv['1H'].empty:
             last_candle_time = ohlcv['1H'].index[-1].to_pydatetime()
@@ -259,40 +389,46 @@ async def log_predictions(buf):
         try:
             # Skip if a prediction for this exact maturity already exists
             existing = conn.execute("""
-                SELECT id FROM predictions
-                WHERE pair = ? AND matures_at = ?
+                SELECT id FROM predictions WHERE pair = ? AND matures_at = ?
             """, (pair, matures_at.isoformat())).fetchone()
             if existing:
                 continue
 
-            # Check cooldown for tradeable signals
-            if result['is_tradeable'] and pair in cooldown_pairs:
+            is_signal = result['is_signal']
+
+            # Cooldown: only applies to signals, not MFE-below-threshold logs
+            if is_signal and pair in cooldown_pairs:
                 skipped_cooldown += 1
-                # Still log it but mark as not tradeable due to cooldown
-                result = dict(result)
-                result['is_tradeable'] = False
-                result['_cooldown_skipped'] = True
+                is_signal = False   # suppress signal flag — still log the bar
 
             conn.execute("""
                 INSERT INTO predictions (
-                    logged_at, pair, direction,
-                    q25, q50, q75,
-                    meta_proba, is_tradeable,
+                    logged_at, pair, mfe_q50_pips, is_signal,
+                    direction, direction_label,
                     entry_price, matures_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 now.isoformat(),
                 pair,
+                result['mfe_q50_pips'],
+                int(is_signal),
                 result['direction'],
-                result['q25'],
-                result['q50'],
-                result['q75'],
-                result['meta_proba'],
-                int(result['is_tradeable']),
+                result['direction_label'],
                 entry_price,
                 matures_at.isoformat(),
             ))
             logged += 1
+
+            if is_signal:
+                signals_fired += 1
+                new_signals.append({
+                    'pair':            pair,
+                    'mfe_q50_pips':    result['mfe_q50_pips'],
+                    'direction_label': result['direction_label'],
+                    'entry_price':     entry_price,
+                    'logged_at':       now.isoformat(),
+                    'matures_at':      matures_at.isoformat(),
+                })
 
         except Exception as e:
             msg = f'{pair}: {e}'
@@ -300,152 +436,166 @@ async def log_predictions(buf):
             logger.error(msg)
 
     conn.execute(
-        "INSERT INTO hourly_log (logged_at, pairs_logged, pairs_skipped_cooldown, errors) VALUES (?, ?, ?, ?)",
-        (now.isoformat(), logged, skipped_cooldown,
+        "INSERT INTO hourly_log (logged_at, pairs_logged, signals_fired, pairs_skipped_cooldown, errors) VALUES (?, ?, ?, ?, ?)",
+        (now.isoformat(), logged, signals_fired, skipped_cooldown,
          '; '.join(errors) if errors else None)
     )
     conn.commit()
     conn.close()
 
-    logger.info(f'Logged {logged} predictions for {len(predictions)} pairs. '
-                f'Cooldown skipped: {skipped_cooldown}. (candle T={last_candle_time.isoformat()})')
+    logger.info(
+        f'Logged {logged} bars. Signals: {signals_fired}. '
+        f'Cooldown skipped: {skipped_cooldown}. (candle T={last_candle_time.isoformat()})'
+    )
+
+    # Email on new signals
+    if new_signals:
+        send_signal_email(new_signals)
+
     return logged
 
 
 # -- Resolve outcomes --
 
-async def _fetch_close_price(pair: str, at_time: datetime) -> float | None:
-    """
-    Fetch the 1H candle close price at a specific time from Polygon REST.
-    """
+async def _fetch_1h_bars(pair: str, from_dt: datetime, to_dt: datetime) -> list:
+    """Fetch 1H OHLCV bars from Polygon for a time window."""
     import httpx
-
     api_key = os.environ.get('POLYGON_API_KEY', os.environ.get('POLYGON_S3_SECRET_KEY', ''))
-    ticker = f'C:{pair}'
-
-    from_date = (at_time - timedelta(days=1)).strftime('%Y-%m-%d')
-    to_date = (at_time + timedelta(days=1)).strftime('%Y-%m-%d')
-
-    url = f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/hour/{from_date}/{to_date}'
-    params = {'apiKey': api_key, 'limit': 50000, 'sort': 'asc'}
-
+    ticker  = f'C:{pair}'
+    url     = f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/hour/{from_dt.strftime("%Y-%m-%d")}/{to_dt.strftime("%Y-%m-%d")}'
+    params  = {'apiKey': api_key, 'limit': 50000, 'sort': 'asc'}
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
-            data = resp.json()
-
-        results = data.get('results', [])
-        logger.info(f'Polygon {pair} at {at_time}: {len(results)} bars returned')
-        if not results:
-            return None
-
-        # Find the bar whose CLOSE corresponds to at_time.
-        # Bar opens at T, closes at T+1H. We want bar with open < at_time.
-        target_ts = int(at_time.timestamp() * 1000)
-        best = None
-        for bar in results:
-            if bar['t'] < target_ts:
-                best = bar
-            else:
-                break
-
-        if best is not None:
-            # Validate: bar open should be exactly 1H before at_time
-            # (tolerance of 5 min for slight timestamp drifts)
-            expected_open_ms = target_ts - 3600 * 1000
-            if abs(best['t'] - expected_open_ms) > 300_000:
-                logger.warning(
-                    f'{pair}: nearest bar open {best["t"]} too far from expected '
-                    f'{expected_open_ms} (at_time={at_time}) -- likely weekend gap, skipping'
-                )
-                return None
-            return float(best['c'])
-
-        return None
-
+            return resp.json().get('results', [])
     except Exception as e:
-        logger.warning(f'Failed to fetch close price for {pair} at {at_time}: {e}')
-        return None
+        logger.warning(f'Failed to fetch bars for {pair}: {e}')
+        return []
 
 
 async def resolve_outcomes():
     """
-    Find predictions that have matured and not yet resolved.
-    Fetches actual prices from Polygon REST.
+    Find signals that have matured and compute actual outcomes:
+      - actual_mfe_pips : max(up_move, down_move) over the 72h window
+      - actual_mae_pips : min(up_move, down_move) over the 72h window
+      - fwd_72h_pips    : price at T+72h minus entry (signed)
+      - correct         : 1 if direction matches fwd_72h sign, else 0 (NULL if no direction)
     """
-    now = datetime.now(timezone.utc)
+    from features import PIP_SIZE
+
+    now  = datetime.now(timezone.utc)
     conn = get_db()
 
     pending = conn.execute("""
         SELECT * FROM predictions
         WHERE resolved_at IS NULL
           AND matures_at <= ?
+          AND is_signal = 1
     """, (now.isoformat(),)).fetchall()
 
     if not pending:
-        logger.info('No pending predictions to resolve.')
+        logger.info('No pending signals to resolve.')
         conn.close()
         return 0
 
-    logger.info(f'Resolving {len(pending)} matured predictions...')
-
+    logger.info(f'Resolving {len(pending)} matured signals...')
     resolved = 0
 
     for row in pending:
         pair = row['pair']
-
         try:
             matures_at = datetime.fromisoformat(row['matures_at'])
+            if matures_at.tzinfo is None:
+                matures_at = matures_at.replace(tzinfo=timezone.utc)
 
-            # If matured > 48h ago and still unresolved, mark as expired silently
-            if (now - matures_at.replace(tzinfo=timezone.utc if matures_at.tzinfo is None else matures_at.tzinfo)).total_seconds() > 48 * 3600:
-                conn.execute("""
-                    UPDATE predictions
-                    SET resolved_at = ?, actual_return = NULL, correct = NULL
-                    WHERE id = ?
-                """, (now.isoformat(), row['id']))
+            # If matured > 48h ago and still unresolved, mark as expired
+            if (now - matures_at).total_seconds() > 48 * 3600:
+                conn.execute(
+                    "UPDATE predictions SET resolved_at = ? WHERE id = ?",
+                    (now.isoformat(), row['id'])
+                )
                 resolved += 1
                 continue
 
-            exit_price = await _fetch_close_price(pair, matures_at)
-            if exit_price is None:
+            logged_at = datetime.fromisoformat(row['logged_at'])
+            if logged_at.tzinfo is None:
+                logged_at = logged_at.replace(tzinfo=timezone.utc)
+
+            # Fetch ~75h of 1H bars starting from signal bar
+            bars = await _fetch_1h_bars(
+                pair,
+                logged_at - timedelta(hours=2),
+                matures_at + timedelta(hours=2),
+            )
+            if not bars:
                 continue
 
-            entry_price = row['entry_price']
+            # Convert to arrays, filter to the 72h forward window
+            bar_times  = [datetime.fromtimestamp(b['t'] / 1000, tz=timezone.utc) for b in bars]
+            bar_highs  = [b['h'] for b in bars]
+            bar_lows   = [b['l'] for b in bars]
+            bar_closes = [b['c'] for b in bars]
 
+            entry_price = row['entry_price']
             if entry_price is None or entry_price == 0:
                 logger.warning(f'No entry price for prediction {row["id"]}')
                 continue
 
-            # Log return (matches training labels)
-            actual_return = np.log(exit_price / entry_price)
+            # Find entry bar index (closest bar at or after logged_at)
+            entry_idx = None
+            for i, t in enumerate(bar_times):
+                if t >= logged_at:
+                    entry_idx = i
+                    break
+            if entry_idx is None:
+                continue
 
-            # Was the directional prediction correct?
-            # Only score tradeable predictions
+            # Window: next 72 bars (hours) after entry
+            window_end_idx = min(entry_idx + 72, len(bars) - 1)
+            if window_end_idx <= entry_idx:
+                continue
+
+            h_slice = bar_highs[entry_idx + 1 : window_end_idx + 1]
+            l_slice = bar_lows[entry_idx + 1  : window_end_idx + 1]
+            c_slice = bar_closes[entry_idx + 1: window_end_idx + 1]
+
+            if not h_slice:
+                continue
+
+            pip = PIP_SIZE.get(pair, 0.0001)
+
+            up_move   = (max(h_slice) - entry_price) / pip
+            down_move = (entry_price - min(l_slice))  / pip
+
+            actual_mfe_pips = round(max(up_move, down_move), 1)
+            actual_mae_pips = round(min(up_move, down_move), 1)
+
+            # Forward price at T+72h (last close in window)
+            exit_price    = c_slice[-1]
+            fwd_72h_pips  = round((exit_price - entry_price) / pip, 1)
+
+            # Direction correctness
             direction = row['direction']
-            is_tradeable = row['is_tradeable']
-
-            if not is_tradeable:
-                correct = None  # non-signal, still record return
-            elif direction == 'bullish':
-                correct = int(actual_return > 0)
-            elif direction == 'bearish':
-                correct = int(actual_return < 0)
-            else:
+            if direction is None:
                 correct = None
+            else:
+                correct = 1 if (direction == 1 and fwd_72h_pips > 0) or \
+                                (direction == -1 and fwd_72h_pips < 0) else 0
 
             conn.execute("""
                 UPDATE predictions
-                SET resolved_at   = ?,
-                    exit_price    = ?,
-                    actual_return = ?,
-                    correct       = ?
+                SET resolved_at     = ?,
+                    actual_mfe_pips = ?,
+                    actual_mae_pips = ?,
+                    fwd_72h_pips    = ?,
+                    correct         = ?
                 WHERE id = ?
             """, (
                 now.isoformat(),
-                exit_price,
-                round(actual_return, 8),
+                actual_mfe_pips,
+                actual_mae_pips,
+                fwd_72h_pips,
                 correct,
                 row['id'],
             ))
@@ -456,184 +606,104 @@ async def resolve_outcomes():
 
     conn.commit()
     conn.close()
-    logger.info(f'Resolved {resolved} predictions.')
+    logger.info(f'Resolved {resolved} signals.')
     return resolved
 
 
-# -- Report --
+# -- Report (CLI) --
 
 def print_report():
-    """Print accuracy report on all resolved predictions."""
     conn = get_db()
 
-    total = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
-    resolved = conn.execute("SELECT COUNT(*) FROM predictions WHERE resolved_at IS NOT NULL").fetchone()[0]
-    pending = total - resolved
+    total    = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    signals  = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_signal = 1").fetchone()[0]
+    resolved = conn.execute("SELECT COUNT(*) FROM predictions WHERE resolved_at IS NOT NULL AND is_signal = 1").fetchone()[0]
+    pending  = signals - resolved
 
     print('\n' + '=' * 65)
-    print('LUMENY PAPER TRADING REPORT v5.1')
+    print('LUMENY SIGNAL TRACKER v7.0')
     print('=' * 65)
-    print(f'Total predictions logged : {total:,}')
+    print(f'Total bars logged        : {total:,}')
+    print(f'Signals (MFE >= 70)      : {signals:,}')
     print(f'Resolved                 : {resolved:,}')
     print(f'Pending                  : {pending:,}')
 
     if resolved == 0:
-        print('\nNo resolved predictions yet.')
+        print('\nNo resolved signals yet.')
         conn.close()
         return
 
     df = pd.read_sql("""
-        SELECT * FROM predictions WHERE resolved_at IS NOT NULL AND correct IS NOT NULL
+        SELECT * FROM predictions WHERE resolved_at IS NOT NULL AND is_signal = 1
     """, conn)
-    df_all = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL", conn)
+    conn.close()
 
     if len(df) == 0:
-        print('\nNo scored predictions yet.')
-        conn.close()
-        return
+        print('\nNo data.'); return
 
     print(f'\nDate range: {df["logged_at"].min()[:10]} -> {df["logged_at"].max()[:10]}')
 
-    # -- Overall accuracy --
-    print('\n' + '-' * 65)
-    print('OVERALL (tradeable signals only)')
-    print('-' * 65)
-    overall_acc = df['correct'].mean()
-    print(f'  Accuracy: {overall_acc:.1%}  (n={len(df):,})')
+    # MFE model accuracy
+    df_mfe = df.dropna(subset=['actual_mfe_pips'])
+    if len(df_mfe) > 0:
+        mfe_acc = (df_mfe['actual_mfe_pips'] >= 70.0).mean()
+        avg_actual_mfe = df_mfe['actual_mfe_pips'].mean()
+        avg_pred_mfe   = df_mfe['mfe_q50_pips'].mean()
+        print(f'\n--- MFE Model Accuracy ---')
+        print(f'  Actual MFE >= 70 pips  : {mfe_acc:.1%}  (n={len(df_mfe)})')
+        print(f'  Avg predicted MFE Q50  : {avg_pred_mfe:.1f} pips')
+        print(f'  Avg actual MFE         : {avg_actual_mfe:.1f} pips')
 
-    # -- By meta_proba threshold --
-    print('\n' + '-' * 65)
-    print('ACCURACY BY META PROBABILITY THRESHOLD')
-    print('-' * 65)
-    thresholds = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
-    print(f'  {"Threshold":<12} {"Accuracy":<12} {"Count":<8} {"Avg |Return|"}')
-    print(f'  {"-"*48}')
+    # Direction accuracy
+    df_dir = df.dropna(subset=['correct'])
+    if len(df_dir) > 0:
+        dir_acc = df_dir['correct'].mean()
+        print(f'\n--- Direction Accuracy (72h fwd) ---')
+        print(f'  Accuracy : {dir_acc:.1%}  (n={len(df_dir)})')
 
-    for t in thresholds:
-        mask = df['meta_proba'] >= t
-        sub = df[mask]
-        if len(sub) < 5:
-            continue
-        acc = sub['correct'].mean()
-        avg_ret = sub['actual_return'].abs().mean()
-        print(f'  P>={t:.2f}      {acc:.1%}        {len(sub):<8} {avg_ret:.6f}')
-
-    # -- By pair --
-    print('\n' + '-' * 65)
-    print('ACCURACY BY PAIR')
-    print('-' * 65)
-    print(f'  {"Pair":<10} {"Accuracy":<12} {"Count":<8} {"Win Rate"}')
-    print(f'  {"-"*40}')
-
+    # By pair
+    print(f'\n--- By Pair ---')
     for pair in sorted(df['pair'].unique()):
-        p_df = df[df['pair'] == pair]
-        if len(p_df) < 3:
-            continue
-        acc = p_df['correct'].mean()
-        print(f'  {pair:<10} {acc:.1%}        {len(p_df):<8}')
-
-    # -- Economic significance --
-    print('\n' + '-' * 65)
-    print('ECONOMIC SIGNIFICANCE')
-    print('-' * 65)
-
-    avg_move = df['actual_return'].abs().mean()
-    win_rate = df['correct'].mean()
-    ev = (win_rate * avg_move) - ((1 - win_rate) * avg_move) - AVG_SPREAD
-    print(f'  Avg |move|: {avg_move:.6f}')
-    print(f'  Win rate:   {win_rate:.1%}')
-    print(f'  EV/trade:   {ev:.6f}  (after {AVG_SPREAD:.5f} spread)')
-
-    # -- Weekly summary --
-    print('\n' + '-' * 65)
-    print('WEEKLY SUMMARY')
-    print('-' * 65)
-    df['logged_dt'] = pd.to_datetime(df['logged_at'])
-    df['week'] = df['logged_dt'].dt.isocalendar().week.astype(int)
-    df['year'] = df['logged_dt'].dt.isocalendar().year.astype(int)
-
-    weekly = df.groupby(['year', 'week']).agg(
-        n=('correct', 'count'),
-        acc=('correct', 'mean'),
-    ).reset_index()
-
-    print(f'  {"Year":<6} {"Week":<6} {"n":<8} {"Accuracy"}')
-    print(f'  {"-"*30}')
-    for _, row in weekly.iterrows():
-        print(f'  {int(row["year"]):<6} {int(row["week"]):<6} {int(row["n"]):<8} {row["acc"]:.1%}')
+        p = df[df['pair'] == pair]
+        p_dir = p.dropna(subset=['correct'])
+        mfe_a = (p.dropna(subset=['actual_mfe_pips'])['actual_mfe_pips'] >= 70).mean() if len(p.dropna(subset=['actual_mfe_pips'])) > 0 else float('nan')
+        dir_a = p_dir['correct'].mean() if len(p_dir) > 0 else float('nan')
+        avg_mfe = p['mfe_q50_pips'].mean()
+        print(f'  {pair:<10} n={len(p):<4}  MFE_acc={mfe_a:.0%}  Dir_acc={dir_a:.0%}  avg_Q50={avg_mfe:.1f}p')
 
     print('\n' + '=' * 65)
-    conn.close()
 
 
 # -- Continuous loop --
 
 async def run_loop():
-    """Run log + resolve + trade every hour indefinitely."""
-    from tradelocker_bot import get_bot
-
-    bot = get_bot()
-    if bot.is_enabled():
-        await bot.initialize()
-
-    logger.info('Starting paper trading loop (every 60 minutes)...')
+    logger.info('Starting signal tracking loop (every hour)...')
     while True:
         try:
             buf = await _init_buffer()
 
-            # 1. Close matured positions on TradeLocker
-            if bot.is_enabled():
-                await bot.close_matured_positions()
-
-            # 2. Resolve paper trading outcomes
+            # 1. Resolve matured signals
             await resolve_outcomes()
 
-            # 3. Run inference and log predictions (with retry if candle not ready)
+            # 2. Run inference and log
             logged = await log_predictions(buf)
 
-            # If no predictions were logged and we're within the first 90s of
-            # the hour, the latest 1H candle may not be available yet on Polygon.
-            # Retry up to 3 times with 15s delay.
-            # Don't retry during weekends or Friday late session (those return 0 intentionally).
+            # Retry if no bars logged (candle may not be ready yet)
             now_check = datetime.now(timezone.utc)
-            is_weekend = (now_check.weekday() == 5 or
-                          (now_check.weekday() == 6 and now_check.hour < 22))
-            is_friday_late = (now_check.weekday() == 4 and now_check.hour >= 17)
-            is_market_open = not is_weekend and not is_friday_late
-            if logged == 0 and now_check.minute < 2 and is_market_open:
+            if logged == 0 and now_check.minute < 3:
                 for attempt in range(1, 4):
-                    logger.info(
-                        f'No predictions logged, candle may not be ready. '
-                        f'Retry {attempt}/3 in 15s...'
-                    )
+                    logger.info(f'No bars logged, candle may not be ready. Retry {attempt}/3 in 15s...')
                     await asyncio.sleep(15)
-                    buf = await _init_buffer()
+                    buf    = await _init_buffer()
                     logged = await log_predictions(buf)
                     if logged > 0:
                         break
 
-            # 4. Place trades for new tradeable signals
-            if bot.is_enabled():
-                conn = get_db()
-                # Get the latest tradeable predictions (logged in the last 5 minutes)
-                cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-                rows = conn.execute("""
-                    SELECT id, pair, direction, q50, meta_proba, is_tradeable, matures_at, entry_price
-                    FROM predictions
-                    WHERE logged_at >= ? AND is_tradeable = 1
-                """, (cutoff,)).fetchall()
-                conn.close()
-
-                if rows:
-                    preds = [dict(r) for r in rows]
-                    await bot.place_trades(preds)
-
         except Exception as e:
             logger.error(f'Loop error: {e}', exc_info=True)
 
-        # Sleep until XX:00:10 of the next hour — run as early as possible
-        # after the 1H candle closes to minimize position entry delay.
-        now = datetime.now(timezone.utc)
+        # Sleep until XX:00:10 of the next hour
+        now      = datetime.now(timezone.utc)
         next_run = (now + timedelta(hours=1)).replace(minute=0, second=10, microsecond=0)
         if next_run <= now:
             next_run += timedelta(hours=1)
@@ -646,13 +716,11 @@ async def run_loop():
 
 from fastapi import FastAPI, Query as Q, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 import jwt
 
-monitor_app = FastAPI(title='LumenY Paper Trading Monitor v5.1', version='2.0.0')
+monitor_app = FastAPI(title='LumenY Signal Tracker v7.0', version='7.0.0')
 monitor_app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
-
-# -- Auth --
 
 _JWT_SECRET   = os.environ.get('JWT_SECRET', 'change-me-in-production')
 _MONITOR_PASS = os.environ.get('MONITOR_PASSWORD', '')
@@ -679,95 +747,174 @@ async def login(body: dict):
     import datetime as _dt
     token = jwt.encode(
         {'exp': _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=_TOKEN_TTL_H)},
-        _JWT_SECRET,
-        algorithm='HS256',
+        _JWT_SECRET, algorithm='HS256',
     )
     response = JSONResponse({'ok': True, 'expires_in_hours': _TOKEN_TTL_H})
-    response.set_cookie(
-        key='lumeny_session',
-        value=token,
-        httponly=True,
-        max_age=_TOKEN_TTL_H * 3600,
-        samesite='lax',
-    )
+    response.set_cookie(key='lumeny_session', value=token, httponly=True,
+                        max_age=_TOKEN_TTL_H * 3600, samesite='lax')
     return response
 
 
-# -- API endpoints --
-
-@monitor_app.get('/api/monitor/report')
-async def api_report(_: None = Depends(_require_auth)):
-    """Full accuracy report."""
-    return _get_report_data()
-
-
-@monitor_app.get('/api/monitor/predictions')
-async def api_predictions(
-    pair: str = Q(default=None),
+@monitor_app.get('/api/signals')
+async def api_signals(
+    pair:     str  = Q(default=None),
     resolved: bool = Q(default=None),
-    tradeable: bool = Q(default=None),
-    limit: int = Q(default=100),
+    limit:    int  = Q(default=100),
     _: None = Depends(_require_auth),
 ):
-    """Browse raw predictions."""
-    conn = get_db()
-    query = "SELECT * FROM predictions WHERE 1=1"
+    """Browse raw signals."""
+    conn  = get_db()
+    query = "SELECT * FROM predictions WHERE is_signal = 1"
     params = []
     if pair:
         query += " AND pair = ?"
         params.append(pair.upper())
     if resolved is not None:
-        if resolved:
-            query += " AND resolved_at IS NOT NULL"
-        else:
-            query += " AND resolved_at IS NULL"
-    if tradeable is not None:
-        query += " AND is_tradeable = ?"
-        params.append(int(tradeable))
+        query += " AND resolved_at IS NOT NULL" if resolved else " AND resolved_at IS NULL"
     query += " ORDER BY logged_at DESC LIMIT ?"
     params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return {'signals': [dict(r) for r in rows], 'count': len(rows)}
 
+
+@monitor_app.get('/api/monitor/health')
+async def api_health():
+    conn     = get_db()
+    last_log = conn.execute("SELECT * FROM hourly_log ORDER BY id DESC LIMIT 1").fetchone()
+    signals  = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_signal = 1").fetchone()[0]
+    pending  = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_signal = 1 AND resolved_at IS NULL").fetchone()[0]
+    conn.close()
+    return {
+        'status':        'ok',
+        'db_path':       str(DB_PATH),
+        'total_signals': signals,
+        'pending':       pending,
+        'last_log':      dict(last_log) if last_log else None,
+    }
+
+
+@monitor_app.get('/api/monitor/summary')
+async def api_summary(_: None = Depends(_require_auth)):
+    """Quick stats."""
+    conn = get_db()
+    total_bars = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    total_sigs = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_signal = 1").fetchone()[0]
+    resolved   = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_signal = 1 AND resolved_at IS NOT NULL").fetchone()[0]
+    row = conn.execute("""
+        SELECT COUNT(*) as n, AVG(correct) as acc
+        FROM predictions WHERE is_signal = 1 AND resolved_at IS NOT NULL AND correct IS NOT NULL
+    """).fetchone()
+    mfe_row = conn.execute("""
+        SELECT AVG(CASE WHEN actual_mfe_pips >= 70 THEN 1.0 ELSE 0.0 END) as mfe_acc,
+               AVG(actual_mfe_pips) as avg_mfe
+        FROM predictions WHERE is_signal = 1 AND actual_mfe_pips IS NOT NULL
+    """).fetchone()
+    conn.close()
+    return {
+        'total_bars':    total_bars,
+        'total_signals': total_sigs,
+        'resolved':      resolved,
+        'pending':       total_sigs - resolved,
+        'dir_accuracy':  round(float(row['acc']), 4) if row['n'] > 0 and row['acc'] is not None else None,
+        'dir_n':         row['n'],
+        'mfe_accuracy':  round(float(mfe_row['mfe_acc']), 4) if mfe_row['mfe_acc'] is not None else None,
+        'avg_actual_mfe': round(float(mfe_row['avg_mfe']), 1) if mfe_row['avg_mfe'] is not None else None,
+    }
+
+
+@monitor_app.get('/api/monitor/predictions')
+async def api_predictions(
+    pair:      str  = Q(default=None),
+    resolved:  bool = Q(default=None),
+    signal_only: bool = Q(default=True),
+    limit:     int  = Q(default=100),
+    _: None = Depends(_require_auth),
+):
+    """Browse raw predictions with filters."""
+    conn   = get_db()
+    query  = "SELECT * FROM predictions WHERE 1=1"
+    params = []
+    if signal_only:
+        query += " AND is_signal = 1"
+    if pair:
+        query += " AND pair = ?"
+        params.append(pair.upper())
+    if resolved is not None:
+        query += " AND resolved_at IS NOT NULL" if resolved else " AND resolved_at IS NULL"
+    query += " ORDER BY logged_at DESC LIMIT ?"
+    params.append(limit)
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return {'predictions': [dict(r) for r in rows], 'count': len(rows)}
 
 
-@monitor_app.get('/api/monitor/summary')
-async def api_summary(_: None = Depends(_require_auth)):
-    """Quick summary."""
+@monitor_app.get('/api/monitor/report')
+async def api_report(_: None = Depends(_require_auth)):
+    """Full accuracy report."""
     conn = get_db()
-    total = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
-    resolved = conn.execute("SELECT COUNT(*) FROM predictions WHERE resolved_at IS NOT NULL").fetchone()[0]
-    tradeable_total = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_tradeable = 1").fetchone()[0]
-
-    summary = {
-        'total': total,
-        'resolved': resolved,
-        'pending': total - resolved,
-        'tradeable_total': tradeable_total,
-    }
-
-    if resolved > 0:
-        row = conn.execute(
-            "SELECT COUNT(*) as n, AVG(correct) as acc FROM predictions WHERE resolved_at IS NOT NULL AND correct IS NOT NULL"
-        ).fetchone()
-        if row['n'] > 0:
-            summary['accuracy'] = {'n': row['n'], 'accuracy': round(float(row['acc']), 4)}
-
+    df = pd.read_sql(
+        "SELECT * FROM predictions WHERE is_signal = 1 AND resolved_at IS NOT NULL", conn
+    )
     conn.close()
-    return summary
+
+    if len(df) == 0:
+        return {'message': 'No resolved signals yet.'}
+
+    df_mfe = df.dropna(subset=['actual_mfe_pips'])
+    df_dir = df.dropna(subset=['correct'])
+
+    by_pair = {}
+    for pair in sorted(df['pair'].unique()):
+        p     = df[df['pair'] == pair]
+        p_mfe = p.dropna(subset=['actual_mfe_pips'])
+        p_dir = p.dropna(subset=['correct'])
+        by_pair[pair] = {
+            'n':            int(len(p)),
+            'avg_q50':      round(float(p['mfe_q50_pips'].mean()), 1),
+            'mfe_acc':      round(float((p_mfe['actual_mfe_pips'] >= 70).mean()), 4) if len(p_mfe) > 0 else None,
+            'avg_actual_mfe': round(float(p_mfe['actual_mfe_pips'].mean()), 1) if len(p_mfe) > 0 else None,
+            'dir_acc':      round(float(p_dir['correct'].mean()), 4) if len(p_dir) > 0 else None,
+            'dir_n':        int(len(p_dir)),
+        }
+
+    df['logged_dt'] = pd.to_datetime(df['logged_at'])
+    df['month'] = df['logged_dt'].dt.to_period('M').astype(str)
+    monthly = df.groupby('month').agg(
+        n=('mfe_q50_pips', 'count'),
+        avg_q50=('mfe_q50_pips', 'mean'),
+        dir_acc=('correct', 'mean'),
+        mfe_acc_raw=('actual_mfe_pips', lambda x: (x >= 70).mean() if x.notna().any() else None),
+    ).reset_index()
+
+    return {
+        'date_range':   {'from': df['logged_at'].min()[:10], 'to': df['logged_at'].max()[:10]},
+        'total_signals': int(len(df)),
+        'mfe_accuracy': {
+            'n':              int(len(df_mfe)),
+            'pct_above_70':   round(float((df_mfe['actual_mfe_pips'] >= 70).mean()), 4) if len(df_mfe) > 0 else None,
+            'avg_actual_mfe': round(float(df_mfe['actual_mfe_pips'].mean()), 1) if len(df_mfe) > 0 else None,
+            'avg_pred_mfe':   round(float(df['mfe_q50_pips'].mean()), 1),
+        },
+        'dir_accuracy': {
+            'n':     int(len(df_dir)),
+            'value': round(float(df_dir['correct'].mean()), 4) if len(df_dir) > 0 else None,
+        },
+        'by_pair':   by_pair,
+        'by_month':  monthly.to_dict(orient='records'),
+    }
 
 
 @monitor_app.get('/api/monitor/debug')
 async def api_debug():
-    """Last 20 resolved predictions -- no auth required."""
+    """Last 20 resolved signals — no auth required."""
     conn = get_db()
     rows = conn.execute("""
-        SELECT id, pair, direction, q25, q50, q75, meta_proba, is_tradeable,
-               entry_price, exit_price, actual_return, correct,
+        SELECT id, pair, mfe_q50_pips, is_signal, direction, direction_label,
+               entry_price, actual_mfe_pips, actual_mae_pips, fwd_72h_pips, correct,
                logged_at, matures_at, resolved_at
         FROM predictions
-        WHERE resolved_at IS NOT NULL
+        WHERE is_signal = 1 AND resolved_at IS NOT NULL
         ORDER BY id DESC LIMIT 20
     """).fetchall()
     conn.close()
@@ -776,43 +923,34 @@ async def api_debug():
 
 @monitor_app.get('/api/monitor/live-snapshot')
 async def api_live_snapshot():
-    """Fetch last 3 days of 1H OHLCV for each pair -- no auth required."""
+    """Last 3 days of 1H OHLCV per pair — no auth required."""
     import httpx
-    from data_service import PAIRS
-
     api_key = os.environ.get('POLYGON_API_KEY', os.environ.get('POLYGON_S3_SECRET_KEY', ''))
-    now = datetime.now(timezone.utc)
+    now      = datetime.now(timezone.utc)
     from_date = (now - timedelta(days=3)).strftime('%Y-%m-%d')
-    to_date = now.strftime('%Y-%m-%d')
+    to_date   = now.strftime('%Y-%m-%d')
 
     snapshot = {'generated_at': now.isoformat(), 'pairs': {}}
 
     async with httpx.AsyncClient(timeout=20) as client:
         for pair in PAIRS:
             ticker = f'C:{pair}'
-            url = f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/hour/{from_date}/{to_date}'
+            url    = f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/hour/{from_date}/{to_date}'
             try:
                 resp = await client.get(url, params={'apiKey': api_key, 'limit': 200, 'sort': 'asc'})
                 resp.raise_for_status()
-                data = resp.json()
-                results = data.get('results', [])
-
+                results = resp.json().get('results', [])
                 if not results:
-                    snapshot['pairs'][pair] = {'error': 'no data', 'status': data.get('status')}
+                    snapshot['pairs'][pair] = {'error': 'no data'}
                     continue
-
                 current_hour_ms = int(now.replace(minute=0, second=0, microsecond=0).timestamp() * 1000)
-                closed_bars = [b for b in results if b['t'] < current_hour_ms]
-                last_closed = closed_bars[-1] if closed_bars else None
-
+                closed = [b for b in results if b['t'] < current_hour_ms]
+                last   = closed[-1] if closed else None
                 snapshot['pairs'][pair] = {
-                    'total_bars_returned': len(results),
-                    'closed_bars_count': len(closed_bars),
-                    'last_closed_bar': {
-                        'open_time_utc': datetime.fromtimestamp(last_closed['t'] / 1000, tz=timezone.utc).isoformat() if last_closed else None,
-                        'close': last_closed['c'] if last_closed else None,
-                    },
-                    'expected_entry_price': last_closed['c'] if last_closed else None,
+                    'bars_returned':  len(results),
+                    'closed_bars':    len(closed),
+                    'last_close':     float(last['c']) if last else None,
+                    'last_bar_utc':   datetime.fromtimestamp(last['t'] / 1000, tz=timezone.utc).isoformat() if last else None,
                 }
             except Exception as e:
                 snapshot['pairs'][pair] = {'error': str(e)}
@@ -820,259 +958,121 @@ async def api_live_snapshot():
     return snapshot
 
 
-@monitor_app.get('/api/monitor/health')
-async def api_health(_: None = Depends(_require_auth)):
-    from tradelocker_bot import get_bot
+def _get_dashboard_data() -> dict:
+    """All data for the dashboard in one call."""
     conn = get_db()
-    last_log = conn.execute("SELECT * FROM hourly_log ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
-    bot = get_bot()
-    return {
-        'status': 'ok',
-        'db_path': str(DB_PATH),
-        'last_log': dict(last_log) if last_log else None,
-        'tradelocker': {
-            'enabled': bot.is_enabled(),
-            'open_positions': len(bot.open_positions),
-            'instruments_mapped': len(bot.instrument_map),
-        },
-    }
 
-
-def _get_report_data() -> dict:
-    """Generate the full report as a JSON-serializable dict."""
-    conn = get_db()
-    total = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
-    resolved_count = conn.execute("SELECT COUNT(*) FROM predictions WHERE resolved_at IS NOT NULL").fetchone()[0]
-    tradeable_count = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_tradeable = 1").fetchone()[0]
-    pending_count = total - resolved_count
-
-    report = {
-        'total_predictions': total,
-        'resolved': resolved_count,
-        'pending': pending_count,
-        'tradeable_total': tradeable_count,
-        'accuracy': {},
-        'by_threshold': [],
-        'by_pair': {},
-        'economic': {},
-        'weekly': [],
-    }
-
-    if resolved_count == 0:
-        conn.close()
-        return report
-
-    df = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL AND correct IS NOT NULL", conn)
-    df_all = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL", conn)
-
-    if len(df) == 0:
-        conn.close()
-        return report
-
-    report['date_range'] = {
-        'from': df['logged_at'].min()[:10],
-        'to': df['logged_at'].max()[:10],
-    }
-
-    # Overall accuracy (tradeable only)
-    report['accuracy'] = {
-        'n': int(len(df)),
-        'value': round(float(df['correct'].mean()), 4),
-    }
-
-    # By meta threshold (strict > to match backtest)
-    for t in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
-        mask = df['meta_proba'] > t
-        sub = df[mask]
-        if len(sub) < 3:
-            continue
-        report['by_threshold'].append({
-            'threshold': t,
-            'accuracy': round(float(sub['correct'].mean()), 4),
-            'count': int(len(sub)),
-            'avg_return': round(float(sub['actual_return'].abs().mean()), 8),
-        })
-
-    # By pair
-    for pair in sorted(df['pair'].unique()):
-        p_df = df[df['pair'] == pair]
-        if len(p_df) < 3:
-            continue
-        report['by_pair'][pair] = {
-            'n': int(len(p_df)),
-            'accuracy': round(float(p_df['correct'].mean()), 4),
-        }
-
-    # Economic
-    avg_move = float(df['actual_return'].abs().mean())
-    win_rate = float(df['correct'].mean())
-    ev = (win_rate * avg_move) - ((1 - win_rate) * avg_move) - AVG_SPREAD
-    report['economic'] = {
-        'avg_move': round(avg_move, 8),
-        'win_rate': round(win_rate, 4),
-        'ev_per_trade': round(ev, 8),
-        'n': int(len(df)),
-    }
-
-    # Weekly
-    df['logged_dt'] = pd.to_datetime(df['logged_at'])
-    df['week'] = df['logged_dt'].dt.isocalendar().week.astype(int)
-    df['year'] = df['logged_dt'].dt.isocalendar().year.astype(int)
-    weekly = df.groupby(['year', 'week']).agg(n=('correct', 'count'), acc=('correct', 'mean')).reset_index()
-    for _, row in weekly.iterrows():
-        report['weekly'].append({
-            'year': int(row['year']),
-            'week': int(row['week']),
-            'n': int(row['n']),
-            'accuracy': round(float(row['acc']), 4),
-        })
-
-    conn.close()
-    return report
-
-
-@monitor_app.get('/api/monitor/dashboard-data')
-async def api_dashboard_data(_: None = Depends(_require_auth)):
-    """All data needed for the monitoring dashboard in one call."""
-    conn = get_db()
-    total = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
-    resolved_count = conn.execute("SELECT COUNT(*) FROM predictions WHERE resolved_at IS NOT NULL").fetchone()[0]
-    tradeable_count = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_tradeable = 1").fetchone()[0]
+    total_bars = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    total_sigs = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_signal = 1").fetchone()[0]
+    resolved   = conn.execute("SELECT COUNT(*) FROM predictions WHERE is_signal = 1 AND resolved_at IS NOT NULL").fetchone()[0]
+    pending    = total_sigs - resolved
 
     data = {
-        'total': total,
-        'resolved': resolved_count,
-        'pending': total - resolved_count,
-        'tradeable_total': tradeable_count,
-        'accuracy': None,
-        'by_threshold': [],
-        'pairs': {},
-        'daily_accuracy': [],
-        'weekly': [],
-        'economic': {},
-        'last_log': None,
+        'total_bars':    total_bars,
+        'total_signals': total_sigs,
+        'resolved':      resolved,
+        'pending':       pending,
+        'accuracy':      None,
+        'mfe_accuracy':  None,
+        'by_pair':       {},
+        'recent_signals': [],
+        'weekly':        [],
+        'last_log':      None,
     }
 
     last_log = conn.execute("SELECT * FROM hourly_log ORDER BY id DESC LIMIT 1").fetchone()
     if last_log:
         data['last_log'] = dict(last_log)
 
-    if resolved_count == 0:
+    if resolved == 0:
+        # Still return recent signals (pending ones)
+        rows = conn.execute("""
+            SELECT * FROM predictions WHERE is_signal = 1
+            ORDER BY logged_at DESC LIMIT 30
+        """).fetchall()
+        data['recent_signals'] = [dict(r) for r in rows]
         conn.close()
         return data
 
-    df = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL AND correct IS NOT NULL", conn)
-    df_all = pd.read_sql("SELECT * FROM predictions WHERE resolved_at IS NOT NULL", conn)
-    conn.close()
+    df = pd.read_sql(
+        "SELECT * FROM predictions WHERE is_signal = 1 AND resolved_at IS NOT NULL", conn
+    )
 
-    if len(df) == 0:
-        return data
-
-    data['date_range'] = {
-        'from': df['logged_at'].min()[:10],
-        'to': df['logged_at'].max()[:10],
-    }
-
-    # Overall accuracy
-    data['accuracy'] = {
-        'n': int(len(df)),
-        'value': round(float(df['correct'].mean()), 4),
-    }
-
-    # Compute PnL per trade: pred_dir * actual_return - spread
-    # pred_dir = +1 for bullish, -1 for bearish
-    df['pred_dir'] = df['direction'].map({'bullish': 1, 'bearish': -1}).fillna(0)
-    df['pnl'] = df['pred_dir'] * df['actual_return'] - AVG_SPREAD
-
-    # By meta threshold (strict > to match backtest)
-    for t in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
-        mask = df['meta_proba'] > t
-        sub = df[mask]
-        if len(sub) < 3:
-            continue
-        sub_pnl = sub['pnl']
-        data['by_threshold'].append({
-            'threshold': t,
-            'accuracy': round(float(sub['correct'].mean()), 4),
-            'count': int(len(sub)),
-            'ev_bps': round(float(sub_pnl.mean() * 10000), 2),
-            'total_pnl': round(float(sub_pnl.sum()), 6),
-            'avg_move_bps': round(float(sub['actual_return'].abs().mean() * 10000), 2),
-        })
-
-    # Per-pair stats
-    for pair in sorted(df['pair'].unique()):
-        p_df = df[df['pair'] == pair]
-        if len(p_df) < 1:
-            continue
-        p_pnl = p_df['pnl']
-        data['pairs'][pair] = {
-            'n': int(len(p_df)),
-            'accuracy': round(float(p_df['correct'].mean()), 4),
-            'ev_bps': round(float(p_pnl.mean() * 10000), 2),
-            'total_pnl': round(float(p_pnl.sum()), 6),
+    if len(df) > 0:
+        data['date_range'] = {
+            'from': df['logged_at'].min()[:10],
+            'to':   df['logged_at'].max()[:10],
         }
 
-    # Daily accuracy + PnL trend
-    df['logged_dt'] = pd.to_datetime(df['logged_at'])
-    df['date'] = df['logged_dt'].dt.date.astype(str)
-    daily = df.groupby('date').agg(
-        n=('correct', 'count'),
-        acc=('correct', 'mean'),
-        daily_pnl=('pnl', 'sum'),
-    ).reset_index()
-    cum_pnl = 0.0
-    for _, row in daily.iterrows():
-        cum_pnl += row['daily_pnl']
-        data['daily_accuracy'].append({
-            'date': row['date'],
-            'n': int(row['n']),
-            'accuracy': round(float(row['acc']), 4),
-            'daily_pnl_bps': round(float(row['daily_pnl'] * 10000), 2),
-            'cum_pnl_bps': round(float(cum_pnl * 10000), 2),
-        })
+        # MFE model accuracy
+        df_mfe = df.dropna(subset=['actual_mfe_pips'])
+        if len(df_mfe) > 0:
+            data['mfe_accuracy'] = {
+                'n':              int(len(df_mfe)),
+                'pct_above_70':   round(float((df_mfe['actual_mfe_pips'] >= 70).mean()), 4),
+                'avg_actual_mfe': round(float(df_mfe['actual_mfe_pips'].mean()), 1),
+                'avg_pred_mfe':   round(float(df_mfe['mfe_q50_pips'].mean()), 1),
+            }
 
-    # Weekly
-    df['week'] = df['logged_dt'].dt.isocalendar().week.astype(int)
-    df['year'] = df['logged_dt'].dt.isocalendar().year.astype(int)
-    weekly = df.groupby(['year', 'week']).agg(
-        n=('correct', 'count'),
-        acc=('correct', 'mean'),
-        weekly_pnl=('pnl', 'sum'),
-    ).reset_index()
-    for _, row in weekly.iterrows():
-        data['weekly'].append({
-            'year': int(row['year']),
-            'week': int(row['week']),
-            'n': int(row['n']),
-            'accuracy': round(float(row['acc']), 4),
-            'pnl_bps': round(float(row['weekly_pnl'] * 10000), 2),
-        })
+        # Direction accuracy
+        df_dir = df.dropna(subset=['correct'])
+        if len(df_dir) > 0:
+            data['accuracy'] = {
+                'n':     int(len(df_dir)),
+                'value': round(float(df_dir['correct'].mean()), 4),
+            }
 
-    # Economic
-    avg_move = float(df['actual_return'].abs().mean())
-    win_rate = float(df['correct'].mean())
-    total_pnl = float(df['pnl'].sum())
-    ev = float(df['pnl'].mean())
-    data['economic'] = {
-        'avg_move_bps': round(avg_move * 10000, 2),
-        'win_rate': round(win_rate, 4),
-        'ev_per_trade_bps': round(ev * 10000, 2),
-        'total_pnl': round(total_pnl, 6),
-        'total_pnl_bps': round(total_pnl * 10000, 2),
-        'n': int(len(df)),
-    }
+        # By pair
+        for pair in sorted(df['pair'].unique()):
+            p     = df[df['pair'] == pair]
+            p_dir = p.dropna(subset=['correct'])
+            p_mfe = p.dropna(subset=['actual_mfe_pips'])
+            data['by_pair'][pair] = {
+                'n':            int(len(p)),
+                'avg_q50':      round(float(p['mfe_q50_pips'].mean()), 1),
+                'mfe_acc':      round(float((p_mfe['actual_mfe_pips'] >= 70).mean()), 4) if len(p_mfe) > 0 else None,
+                'dir_acc':      round(float(p_dir['correct'].mean()), 4) if len(p_dir) > 0 else None,
+                'dir_n':        int(len(p_dir)),
+                'last_dir':     str(p['direction_label'].iloc[-1]) if len(p) > 0 else None,
+            }
 
+        # Weekly
+        df['logged_dt'] = pd.to_datetime(df['logged_at'])
+        df['week'] = df['logged_dt'].dt.isocalendar().week.astype(int)
+        df['year'] = df['logged_dt'].dt.isocalendar().year.astype(int)
+        weekly = df.groupby(['year', 'week']).agg(
+            n=('mfe_q50_pips', 'count'),
+            avg_q50=('mfe_q50_pips', 'mean'),
+            dir_acc=('correct', 'mean'),
+        ).reset_index()
+        for _, row in weekly.iterrows():
+            data['weekly'].append({
+                'year':    int(row['year']),
+                'week':    int(row['week']),
+                'n':       int(row['n']),
+                'avg_q50': round(float(row['avg_q50']), 1),
+                'dir_acc': round(float(row['dir_acc']), 4) if not pd.isna(row['dir_acc']) else None,
+            })
+
+    # Recent signals (last 30, resolved + pending)
+    rows = conn.execute("""
+        SELECT * FROM predictions WHERE is_signal = 1
+        ORDER BY logged_at DESC LIMIT 30
+    """).fetchall()
+    data['recent_signals'] = [dict(r) for r in rows]
+
+    conn.close()
     return data
 
 
-from fastapi.responses import HTMLResponse
+@monitor_app.get('/api/monitor/dashboard-data')
+async def api_dashboard_data(_: None = Depends(_require_auth)):
+    return _get_dashboard_data()
+
 
 @monitor_app.get('/', response_class=HTMLResponse)
 @monitor_app.get('/dashboard', response_class=HTMLResponse)
 async def dashboard():
-    """Self-contained monitoring dashboard."""
     return DASHBOARD_HTML
 
 
@@ -1081,78 +1081,79 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LumenY Paper Trading v5.1</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<title>LumenY v7.0</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0e17; color: #e0e0e0; }
-  .header { background: linear-gradient(135deg, #1a1f2e 0%, #0d1117 100%); padding: 24px 32px; border-bottom: 1px solid #21262d; }
-  .header h1 { font-size: 22px; font-weight: 600; color: #f0f0f0; }
-  .header .subtitle { font-size: 13px; color: #7d8590; margin-top: 4px; }
-  .status-bar { display: flex; gap: 24px; margin-top: 12px; flex-wrap: wrap; }
-  .status-item { font-size: 13px; }
-  .status-item .label { color: #7d8590; }
-  .status-item .value { color: #58a6ff; font-weight: 600; }
-  .status-item .value.good { color: #3fb950; }
-  .status-item .value.warn { color: #d29922; }
-  .status-item .value.bad { color: #f85149; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; padding: 20px 32px; }
-  .card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 20px; }
-  .card h2 { font-size: 15px; font-weight: 600; color: #c9d1d9; margin-bottom: 14px; border-bottom: 1px solid #21262d; padding-bottom: 8px; }
-  .card.full-width { grid-column: 1 / -1; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; color: #7d8590; font-weight: 500; padding: 6px 8px; border-bottom: 1px solid #21262d; }
-  td { padding: 6px 8px; border-bottom: 1px solid #21262d30; }
-  .good { color: #3fb950; }
-  .warn { color: #d29922; }
-  .bad { color: #f85149; }
-  .neutral { color: #7d8590; }
-  .chart-container { position: relative; height: 260px; }
-  .kpi-row { display: flex; gap: 16px; flex-wrap: wrap; padding: 0 32px 4px; }
-  .kpi { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 16px 20px; flex: 1; min-width: 140px; }
-  .kpi .kpi-value { font-size: 28px; font-weight: 700; }
-  .kpi .kpi-label { font-size: 12px; color: #7d8590; margin-top: 2px; }
+  .header { background: linear-gradient(135deg, #1a1f2e 0%, #0d1117 100%); padding: 20px 28px; border-bottom: 1px solid #21262d; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+  .header h1 { font-size: 20px; font-weight: 700; color: #f0f0f0; }
+  .header .sub { font-size: 12px; color: #7d8590; margin-top: 3px; }
   .refresh-btn { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
   .refresh-btn:hover { background: #30363d; }
-  .loading { text-align: center; padding: 60px; color: #7d8590; font-size: 16px; }
-  .verdict { font-size: 14px; padding: 12px; border-radius: 6px; margin-bottom: 12px; }
-  .verdict.pass { background: #0d1f0d; border: 1px solid #238636; color: #3fb950; }
-  .verdict.fail { background: #1f0d0d; border: 1px solid #da3633; color: #f85149; }
-  .verdict.wait { background: #1f1a0d; border: 1px solid #9e6a03; color: #d29922; }
+
+  .kpi-row { display: flex; gap: 12px; flex-wrap: wrap; padding: 16px 28px 4px; }
+  .kpi { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 14px 18px; flex: 1; min-width: 120px; }
+  .kpi .kv { font-size: 26px; font-weight: 700; }
+  .kpi .kl { font-size: 11px; color: #7d8590; margin-top: 3px; text-transform: uppercase; letter-spacing: .5px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 14px; padding: 14px 28px 28px; }
+  .card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 18px; }
+  .card h2 { font-size: 13px; font-weight: 600; color: #8b949e; margin-bottom: 12px; text-transform: uppercase; letter-spacing: .5px; }
+  .card.full { grid-column: 1 / -1; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: #7d8590; font-weight: 500; padding: 5px 8px; border-bottom: 1px solid #21262d; font-size: 12px; }
+  td { padding: 6px 8px; border-bottom: 1px solid #21262d20; }
+  tr:last-child td { border-bottom: none; }
+
+  .good    { color: #3fb950; }
+  .warn    { color: #d29922; }
+  .bad     { color: #f85149; }
+  .neutral { color: #7d8590; }
+  .long    { color: #3fb950; font-weight: 600; }
+  .short   { color: #f85149; font-weight: 600; }
+  .norule  { color: #7d8590; font-style: italic; }
+
+  .signal-badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .signal-badge.long  { background: #0d3b1b; color: #3fb950; }
+  .signal-badge.short { background: #3b0d0d; color: #f85149; }
+  .signal-badge.none  { background: #1c1c2a; color: #7d8590; }
+
+  .status-bar { display: flex; gap: 20px; flex-wrap: wrap; padding: 10px 28px; background: #0d1117; border-bottom: 1px solid #21262d; font-size: 12px; }
+  .si .sl { color: #7d8590; } .si .sv { color: #58a6ff; font-weight: 600; margin-left: 4px; }
+
+  .loading { text-align: center; padding: 60px; color: #7d8590; }
+  .score-bar { height: 4px; background: #21262d; border-radius: 2px; margin-top: 5px; }
+  .score-fill { height: 100%; border-radius: 2px; background: #58a6ff; }
 </style>
 </head>
 <body>
 
 <div class="header">
-  <div style="display:flex; justify-content:space-between; align-items:center;">
-    <div>
-      <h1>LumenY Paper Trading v5.1</h1>
-      <div class="subtitle">Microstructure model &mdash; 2H forward, meta-filtered, per-pair cooldown</div>
-    </div>
-    <button class="refresh-btn" onclick="loadData()">Refresh</button>
+  <div>
+    <h1>LumenY &mdash; Signal Tracker v7.0</h1>
+    <div class="sub">MFE Q50 &ge; 70 pips &bull; Rule-based direction &bull; 72h window &bull; Hours 7-20 UTC</div>
   </div>
-  <div class="status-bar" id="statusBar"></div>
+  <button class="refresh-btn" onclick="loadData()">Refresh</button>
 </div>
 
-<div class="kpi-row" id="kpiRow" style="margin-top:20px;"></div>
-
-<div class="grid" id="grid">
-  <div class="loading">Loading data...</div>
-</div>
+<div class="status-bar" id="statusBar"></div>
+<div class="kpi-row" id="kpiRow"></div>
+<div class="grid" id="grid"><div class="loading">Loading...</div></div>
 
 <script>
-function showLogin(error) {
+function showLogin(err) {
   document.body.innerHTML = `
     <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0a0e17;">
-      <div style="background:#0d1420;border:1px solid #1e2d45;border-radius:12px;padding:40px;width:340px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:#58a6ff;margin-bottom:8px;">LumenY v5.1</div>
-        <div style="color:#7d8fa3;margin-bottom:28px;font-size:13px;">Paper Trading Monitor</div>
-        ${error ? '<div style="color:#f85149;margin-bottom:16px;font-size:13px;">' + error + '</div>' : ''}
+      <div style="background:#0d1420;border:1px solid #1e2d45;border-radius:12px;padding:40px;width:320px;text-align:center;">
+        <div style="font-size:20px;font-weight:700;color:#58a6ff;margin-bottom:6px;">LumenY v7.0</div>
+        <div style="color:#7d8fa3;margin-bottom:24px;font-size:12px;">Signal Tracker</div>
+        ${err ? '<div style="color:#f85149;margin-bottom:14px;font-size:12px;">' + err + '</div>' : ''}
         <input id="pw" type="password" placeholder="Password" autofocus
-          style="width:100%;padding:10px 14px;border-radius:8px;border:1px solid #1e2d45;background:#111827;color:#e0e0e0;font-size:14px;margin-bottom:14px;outline:none;" />
+          style="width:100%;padding:9px 12px;border-radius:7px;border:1px solid #1e2d45;background:#111827;color:#e0e0e0;font-size:14px;margin-bottom:12px;outline:none;" />
         <button onclick="doLogin()"
-          style="width:100%;padding:10px;border-radius:8px;border:none;background:#58a6ff;color:#0a0e17;font-weight:700;font-size:14px;cursor:pointer;">
-          Login
+          style="width:100%;padding:9px;border-radius:7px;border:none;background:#58a6ff;color:#0a0e17;font-weight:700;font-size:14px;cursor:pointer;">
+          Sign in
         </button>
       </div>
     </div>`;
@@ -1163,248 +1164,132 @@ async function doLogin() {
   const password = document.getElementById('pw').value;
   try {
     const res = await fetch('/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ password }),
     });
     if (!res.ok) { showLogin('Invalid password.'); return; }
     location.reload();
-  } catch(e) {
-    showLogin('Login failed: ' + e.message);
-  }
+  } catch(e) { showLogin('Login failed: ' + e.message); }
 }
 
-function fmt(v, d=1) { return v != null ? (v * 100).toFixed(d) + '%' : 'N/A'; }
-function accClass(v) { return v >= 0.55 ? 'good' : v >= 0.50 ? 'warn' : 'bad'; }
+function pct(v, d=1)   { return v != null ? (v * 100).toFixed(d) + '%' : '--'; }
+function pip(v, d=1)   { return v != null ? v.toFixed(d) + 'p' : '--'; }
+function accCls(v)     { return v == null ? 'neutral' : v >= 0.60 ? 'good' : v >= 0.52 ? 'warn' : 'bad'; }
+function dirBadge(lbl) {
+  if (lbl === 'LONG')    return '<span class="signal-badge long">LONG</span>';
+  if (lbl === 'SHORT')   return '<span class="signal-badge short">SHORT</span>';
+  return '<span class="signal-badge none">NO RULE</span>';
+}
+function resultCell(r) {
+  if (r.resolved_at == null) return '<span class="neutral">Pending</span>';
+  if (r.correct == null)     return '<span class="neutral">--</span>';
+  return r.correct ? '<span class="good">Correct</span>' : '<span class="bad">Wrong</span>';
+}
 
 async function loadData() {
   try {
     const res = await fetch('/api/monitor/dashboard-data');
     if (res.status === 401) { showLogin(); return; }
-    const d = await res.json();
-    render(d);
+    render(await res.json());
   } catch(e) {
     document.getElementById('grid').innerHTML = '<div class="loading">Error: ' + e.message + '</div>';
   }
 }
 
 function render(d) {
-  const sb = document.getElementById('statusBar');
-  const lastLog = d.last_log ? d.last_log.logged_at : 'never';
-  const cooldownSkipped = d.last_log ? (d.last_log.pairs_skipped_cooldown || 0) : 0;
-  sb.innerHTML = `
-    <div class="status-item"><span class="label">Last run:</span> <span class="value">${lastLog}</span></div>
-    <div class="status-item"><span class="label">Total:</span> <span class="value">${d.total}</span></div>
-    <div class="status-item"><span class="label">Resolved:</span> <span class="value good">${d.resolved}</span></div>
-    <div class="status-item"><span class="label">Pending:</span> <span class="value warn">${d.pending}</span></div>
-    <div class="status-item"><span class="label">Tradeable:</span> <span class="value">${d.tradeable_total}</span></div>
-    <div class="status-item"><span class="label">Date range:</span> <span class="value">${d.date_range ? d.date_range.from + ' to ' + d.date_range.to : 'N/A'}</span></div>
+  // Status bar
+  const ll = d.last_log;
+  document.getElementById('statusBar').innerHTML = `
+    <div class="si"><span class="sl">Last run:</span><span class="sv">${ll ? ll.logged_at.slice(0,16) : 'never'}</span></div>
+    <div class="si"><span class="sl">Signals:</span><span class="sv">${d.total_signals}</span></div>
+    <div class="si"><span class="sl">Resolved:</span><span class="sv">${d.resolved}</span></div>
+    <div class="si"><span class="sl">Pending:</span><span class="sv">${d.pending}</span></div>
+    ${d.date_range ? '<div class="si"><span class="sl">Range:</span><span class="sv">' + d.date_range.from + ' \u2192 ' + d.date_range.to + '</span></div>' : ''}
+    ${ll && ll.signals_fired > 0 ? '<div class="si"><span class="sl">Last cycle signals:</span><span class="sv good">' + ll.signals_fired + '</span></div>' : ''}
   `;
 
-  const kpi = document.getElementById('kpiRow');
-  const acc = d.accuracy ? d.accuracy.value : null;
-  const evBps = d.economic ? d.economic.ev_per_trade_bps : null;
-  const totalPnlBps = d.economic ? d.economic.total_pnl_bps : null;
-  const totalPnlRaw = d.economic ? d.economic.total_pnl : null;
-
-  let verdict = 'wait', verdictText = 'Collecting data...';
-  if (d.resolved >= 50) {
-    if (acc >= 0.55) { verdict = 'pass'; verdictText = 'Model performing as expected'; }
-    else if (acc < 0.50) { verdict = 'fail'; verdictText = 'Model underperforming -- investigate'; }
-    else { verdict = 'wait'; verdictText = 'Borderline -- need more data'; }
-  }
-
-  kpi.innerHTML = `
-    <div class="kpi"><div class="kpi-value ${acc != null ? accClass(acc) : 'neutral'}">${acc != null ? fmt(acc) : '--'}</div><div class="kpi-label">Win Rate (tradeable)</div></div>
-    <div class="kpi"><div class="kpi-value ${evBps != null && evBps > 0 ? 'good' : evBps != null ? 'bad' : 'neutral'}">${evBps != null ? evBps.toFixed(1) + ' bps' : '--'}</div><div class="kpi-label">EV / Trade</div></div>
-    <div class="kpi"><div class="kpi-value ${totalPnlBps != null && totalPnlBps > 0 ? 'good' : totalPnlBps != null ? 'bad' : 'neutral'}">${totalPnlBps != null ? totalPnlBps.toFixed(0) + ' bps' : '--'}</div><div class="kpi-label">Cumulative PnL</div></div>
-    <div class="kpi"><div class="kpi-value ${totalPnlRaw != null && totalPnlRaw > 0 ? 'good' : totalPnlRaw != null ? 'bad' : 'neutral'}">${totalPnlRaw != null ? totalPnlRaw.toFixed(4) : '--'}</div><div class="kpi-label">Total PnL (log return)</div></div>
+  // KPIs
+  const mfe  = d.mfe_accuracy;
+  const dir  = d.accuracy;
+  document.getElementById('kpiRow').innerHTML = `
+    <div class="kpi">
+      <div class="kv ${mfe ? (mfe.pct_above_70 >= 0.55 ? 'good' : mfe.pct_above_70 >= 0.45 ? 'warn' : 'bad') : 'neutral'}">${mfe ? pct(mfe.pct_above_70) : '--'}</div>
+      <div class="kl">MFE Model Accuracy</div>
+    </div>
+    <div class="kpi">
+      <div class="kv ${accCls(dir ? dir.value : null)}">${dir ? pct(dir.value) : '--'}</div>
+      <div class="kl">Direction Accuracy</div>
+    </div>
+    <div class="kpi">
+      <div class="kv neutral">${mfe ? pip(mfe.avg_actual_mfe) : '--'}</div>
+      <div class="kl">Avg Actual MFE</div>
+    </div>
+    <div class="kpi">
+      <div class="kv neutral">${d.total_signals}</div>
+      <div class="kl">Total Signals</div>
+    </div>
   `;
 
   const grid = document.getElementById('grid');
   grid.innerHTML = '';
 
-  // Verdict
-  grid.innerHTML += `<div class="card full-width"><div class="verdict ${verdict}">${verdictText}${d.resolved < 50 ? ' (' + d.resolved + '/50 resolved)' : ''}</div></div>`;
-
-  // Accuracy by meta threshold
-  if (d.by_threshold.length > 0) {
-    let tTable = '<table><tr><th>Threshold</th><th>Win Rate</th><th>EV/Trade</th><th>Total PnL</th><th>Avg Move</th><th>Trades</th></tr>';
-    for (const t of d.by_threshold) {
-      const evC = t.ev_bps > 0 ? 'good' : 'bad';
-      const pnlC = t.total_pnl > 0 ? 'good' : 'bad';
-      const highlight = t.threshold === 0.55 ? ' style="background:#58a6ff10"' : '';
-      tTable += `<tr${highlight}><td>P > ${t.threshold.toFixed(2)}</td><td class="${accClass(t.accuracy)}">${fmt(t.accuracy)}</td><td class="${evC}">${t.ev_bps.toFixed(1)} bps</td><td class="${pnlC}">${(t.total_pnl * 10000).toFixed(0)} bps</td><td>${t.avg_move_bps.toFixed(1)} bps</td><td>${t.count}</td></tr>`;
-    }
-    tTable += '</table>';
-    grid.innerHTML += `<div class="card"><h2>Performance by Meta Threshold</h2>${tTable}</div>`;
-  }
-
-  // Pair breakdown
-  if (Object.keys(d.pairs).length > 0) {
-    let pTable = '<table><tr><th>Pair</th><th>N</th><th>Win Rate</th><th>EV/Trade</th><th>Total PnL</th></tr>';
-    for (const [pair, pd] of Object.entries(d.pairs).sort((a,b) => b[1].total_pnl - a[1].total_pnl)) {
-      const pnlC = pd.total_pnl > 0 ? 'good' : 'bad';
-      pTable += `<tr><td>${pair}</td><td>${pd.n}</td><td class="${accClass(pd.accuracy)}">${fmt(pd.accuracy)}</td><td class="${pd.ev_bps > 0 ? 'good' : 'bad'}">${pd.ev_bps.toFixed(1)} bps</td><td class="${pnlC}">${(pd.total_pnl * 10000).toFixed(0)} bps</td></tr>`;
-    }
-    pTable += '</table>';
-    grid.innerHTML += `<div class="card"><h2>Performance by Pair</h2>${pTable}</div>`;
-  }
-
-  // Daily charts
-  if (d.daily_accuracy.length > 0) {
-    grid.innerHTML += '<div class="card full-width"><h2>Daily Win Rate</h2><div class="chart-container"><canvas id="dailyChart"></canvas></div></div>';
-    grid.innerHTML += '<div class="card full-width"><h2>Cumulative PnL (bps)</h2><div class="chart-container"><canvas id="pnlChart"></canvas></div></div>';
-  }
-
-  // Economic
-  if (d.economic && d.economic.n > 0) {
-    const e = d.economic;
-    const evClass = e.ev_per_trade_bps > 0 ? 'good' : 'bad';
-    const pnlClass = e.total_pnl_bps > 0 ? 'good' : 'bad';
-    grid.innerHTML += `<div class="card"><h2>Economic Value</h2>
-      <table>
-        <tr><td>Win Rate</td><td class="${accClass(e.win_rate)}">${fmt(e.win_rate)}</td></tr>
-        <tr><td>Avg |Move|</td><td>${e.avg_move_bps.toFixed(1)} bps</td></tr>
-        <tr><td>EV / Trade</td><td class="${evClass}">${e.ev_per_trade_bps.toFixed(1)} bps</td></tr>
-        <tr><td>Total PnL</td><td class="${pnlClass}">${e.total_pnl_bps.toFixed(0)} bps</td></tr>
-        <tr><td>Trades</td><td>${e.n}</td></tr>
-      </table>
-    </div>`;
-  }
-
-  // Prediction Explorer
-  grid.innerHTML += `<div class="card full-width">
-    <h2>Prediction Explorer</h2>
-    <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:14px;">
-      <select id="expPair" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:13px;">
-        <option value="">All Pairs</option>
-        ${Object.keys(d.pairs || {}).map(p => '<option>' + p + '</option>').join('')}
-      </select>
-      <select id="expResolved" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:13px;">
-        <option value="">All</option>
-        <option value="true">Resolved</option>
-        <option value="false">Pending</option>
-      </select>
-      <select id="expTradeable" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:13px;">
-        <option value="">All</option>
-        <option value="true">Tradeable</option>
-        <option value="false">Non-tradeable</option>
-      </select>
-      <button class="refresh-btn" onclick="loadPredictions()">Load</button>
-    </div>
-    <div id="expTable" style="max-height:400px;overflow-y:auto;"></div>
-  </div>`;
-  loadPredictions();
-
-  // Render charts
-  if (d.daily_accuracy.length > 0) {
-    // Win rate chart
-    const dailyCtx = document.getElementById('dailyChart').getContext('2d');
-    new Chart(dailyCtx, {
-      type: 'line',
-      data: {
-        labels: d.daily_accuracy.map(x => x.date),
-        datasets: [
-          {
-            label: 'Win Rate',
-            data: d.daily_accuracy.map(x => x.accuracy * 100),
-            borderColor: '#58a6ff',
-            backgroundColor: '#58a6ff20',
-            fill: true,
-            tension: 0.3,
-          },
-          {
-            label: '50% baseline',
-            data: d.daily_accuracy.map(() => 50),
-            borderColor: '#f8514950',
-            borderDash: [2,4],
-            pointRadius: 0,
-          },
-        ],
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        scales: {
-          x: { grid: { color: '#21262d' }, ticks: { color: '#7d8590', maxTicksLimit: 14 } },
-          y: { title: { display: true, text: 'Win Rate %', color: '#7d8590' }, min: 30, max: 80, grid: { color: '#21262d' }, ticks: { color: '#7d8590' } },
-        },
-        plugins: { legend: { labels: { color: '#c9d1d9' } } },
-      },
-    });
-
-    // Cumulative PnL chart
-    const pnlCtx = document.getElementById('pnlChart').getContext('2d');
-    new Chart(pnlCtx, {
-      type: 'line',
-      data: {
-        labels: d.daily_accuracy.map(x => x.date),
-        datasets: [
-          {
-            label: 'Cumulative PnL (bps)',
-            data: d.daily_accuracy.map(x => x.cum_pnl_bps),
-            borderColor: '#3fb950',
-            backgroundColor: '#3fb95020',
-            fill: true,
-            tension: 0.3,
-          },
-          {
-            label: 'Daily PnL (bps)',
-            data: d.daily_accuracy.map(x => x.daily_pnl_bps),
-            borderColor: '#58a6ff80',
-            type: 'bar',
-            backgroundColor: d.daily_accuracy.map(x => x.daily_pnl_bps >= 0 ? '#3fb95060' : '#f8514960'),
-          },
-        ],
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        scales: {
-          x: { grid: { color: '#21262d' }, ticks: { color: '#7d8590', maxTicksLimit: 14 } },
-          y: { title: { display: true, text: 'PnL (bps)', color: '#7d8590' }, grid: { color: '#21262d' }, ticks: { color: '#7d8590' } },
-        },
-        plugins: { legend: { labels: { color: '#c9d1d9' } } },
-      },
-    });
-  }
-}
-
-async function loadPredictions() {
-  const pair = document.getElementById('expPair')?.value || '';
-  const resolved = document.getElementById('expResolved')?.value || '';
-  const tradeable = document.getElementById('expTradeable')?.value || '';
-  const params = new URLSearchParams();
-  if (pair) params.set('pair', pair);
-  if (resolved) params.set('resolved', resolved);
-  if (tradeable) params.set('tradeable', tradeable);
-  params.set('limit', '50');
-  const container = document.getElementById('expTable');
-  if (!container) return;
-  try {
-    const res = await fetch('/api/monitor/predictions?' + params.toString());
-    if (res.status === 401) { showLogin(); return; }
-    const data = await res.json();
-    if (data.predictions.length === 0) {
-      container.innerHTML = '<div class="neutral" style="padding:12px;">No predictions found.</div>';
-      return;
-    }
-    let t = '<table><tr><th>Pair</th><th>Dir</th><th>Meta P</th><th>Q50</th><th>Trade</th><th>Logged</th><th>Result</th><th>Return</th></tr>';
-    for (const p of data.predictions) {
-      const isResolved = p.resolved_at != null;
-      const resultCell = !isResolved
-        ? '<span class="neutral">Pending</span>'
-        : p.correct === null
-          ? '<span class="neutral">--</span>'
-          : `<span class="${p.correct ? 'good' : 'bad'}">${p.correct ? 'Correct' : 'Wrong'}</span>`;
-      const retCell = isResolved && p.actual_return != null ? (p.actual_return * 10000).toFixed(1) + ' bps' : '--';
-      const dir = p.direction === 'bullish' ? '<span class="good">UP</span>' : p.direction === 'bearish' ? '<span class="bad">DOWN</span>' : '<span class="neutral">--</span>';
-      const tradeCell = p.is_tradeable ? '<span class="good">YES</span>' : '<span class="neutral">no</span>';
-      t += `<tr><td>${p.pair}</td><td>${dir}</td><td>${(p.meta_proba*100).toFixed(1)}%</td><td>${(p.q50*10000).toFixed(1)}</td><td>${tradeCell}</td><td>${p.logged_at?.slice(0,16)||'--'}</td><td>${resultCell}</td><td>${retCell}</td></tr>`;
+  // Per-pair table
+  const pairs = Object.entries(d.by_pair);
+  if (pairs.length > 0) {
+    let t = '<table><tr><th>Pair</th><th>N</th><th>Avg Q50</th><th>MFE Acc</th><th>Dir Acc</th><th>Last Dir</th></tr>';
+    for (const [pair, p] of pairs.sort((a,b) => (b[1].avg_q50||0) - (a[1].avg_q50||0))) {
+      t += `<tr>
+        <td><b>${pair}</b></td>
+        <td>${p.n}</td>
+        <td>${pip(p.avg_q50)}</td>
+        <td class="${p.mfe_acc != null ? (p.mfe_acc >= 0.55 ? 'good' : p.mfe_acc >= 0.45 ? 'warn' : 'bad') : 'neutral'}">${pct(p.mfe_acc)}</td>
+        <td class="${accCls(p.dir_acc)}">${pct(p.dir_acc)}${p.dir_n > 0 ? ' <span class="neutral">('+p.dir_n+')</span>' : ''}</td>
+        <td>${dirBadge(p.last_dir)}</td>
+      </tr>`;
     }
     t += '</table>';
-    container.innerHTML = `<div style="font-size:12px;color:#7d8590;margin-bottom:6px;">${data.count} predictions</div>` + t;
-  } catch(e) {
-    container.innerHTML = '<div class="bad" style="padding:12px;">Error: ' + e.message + '</div>';
+    grid.innerHTML += `<div class="card"><h2>Performance by Pair</h2>${t}</div>`;
+  }
+
+  // Weekly table
+  if (d.weekly.length > 0) {
+    let t = '<table><tr><th>Week</th><th>Signals</th><th>Avg Q50</th><th>Dir Acc</th></tr>';
+    for (const w of d.weekly.slice().reverse()) {
+      t += `<tr>
+        <td>${w.year}-W${String(w.week).padStart(2,'0')}</td>
+        <td>${w.n}</td>
+        <td>${pip(w.avg_q50)}</td>
+        <td class="${accCls(w.dir_acc)}">${pct(w.dir_acc)}</td>
+      </tr>`;
+    }
+    t += '</table>';
+    grid.innerHTML += `<div class="card"><h2>Weekly Summary</h2>${t}</div>`;
+  }
+
+  // Recent signals
+  if (d.recent_signals.length > 0) {
+    let t = '<table><tr><th>Time (UTC)</th><th>Pair</th><th>MFE Q50</th><th>Direction</th><th>Entry</th><th>Actual MFE</th><th>72h Move</th><th>Result</th></tr>';
+    for (const s of d.recent_signals) {
+      const actMfe  = s.actual_mfe_pips != null ? pip(s.actual_mfe_pips) : '--';
+      const fwd72   = s.fwd_72h_pips != null ? (s.fwd_72h_pips >= 0 ? '+' : '') + s.fwd_72h_pips.toFixed(1) + 'p' : '--';
+      const fwdCls  = s.fwd_72h_pips == null ? 'neutral' : s.fwd_72h_pips >= 0 ? 'good' : 'bad';
+      t += `<tr>
+        <td>${s.logged_at ? s.logged_at.slice(0,16) : '--'}</td>
+        <td><b>${s.pair}</b></td>
+        <td class="warn">${pip(s.mfe_q50_pips)}</td>
+        <td>${dirBadge(s.direction_label)}</td>
+        <td class="neutral">${s.entry_price ? s.entry_price.toFixed(5) : '--'}</td>
+        <td class="${s.actual_mfe_pips != null && s.actual_mfe_pips >= 70 ? 'good' : 'neutral'}">${actMfe}</td>
+        <td class="${fwdCls}">${fwd72}</td>
+        <td>${resultCell(s)}</td>
+      </tr>`;
+    }
+    t += '</table>';
+    grid.innerHTML += `<div class="card full"><h2>Recent Signals (last 30)</h2><div style="overflow-x:auto;">${t}</div></div>`;
+  }
+
+  if (grid.innerHTML === '') {
+    grid.innerHTML = '<div class="card full"><div class="loading neutral" style="padding:40px;">No signals yet. System is running &mdash; waiting for MFE Q50 &ge; 70 pips.</div></div>';
   }
 }
 
@@ -1418,7 +1303,7 @@ setInterval(loadData, 5 * 60 * 1000);
 # -- CLI --
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='LumenY Paper Trading v5.1')
+    parser = argparse.ArgumentParser(description='LumenY Signal Tracker v7.0')
     parser.add_argument('command', choices=['setup', 'log', 'resolve', 'report', 'run'])
     args = parser.parse_args()
 
@@ -1442,11 +1327,15 @@ if __name__ == '__main__':
 
     elif args.command == 'run':
         import uvicorn
-
         setup_db()
 
         async def _start():
-            config = uvicorn.Config(monitor_app, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), log_level='info')
+            config = uvicorn.Config(
+                monitor_app,
+                host='0.0.0.0',
+                port=int(os.environ.get('PORT', 8080)),
+                log_level='info',
+            )
             server = uvicorn.Server(config)
             asyncio.create_task(server.serve())
             await run_loop()

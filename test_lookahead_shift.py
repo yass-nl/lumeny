@@ -372,8 +372,8 @@ async def main():
 
         # Run both models
         df_test_pair = df_test_pair.copy()
-        X_mfe = df_test_pair[feature_cols].ffill().fillna(0)
-        X_dir = df_test_pair[dir_cols].ffill().fillna(0)
+        X_mfe = df_test_pair[feature_cols].shift(1).ffill().fillna(0)
+        X_dir = df_test_pair[dir_cols].shift(1).ffill().fillna(0)
         df_test_pair['q50_mfe']  = mfe_model.predict(X_mfe)
         df_test_pair['dir_pred'] = dir_model.predict(X_dir)
 

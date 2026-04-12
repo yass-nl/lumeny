@@ -180,7 +180,7 @@ function LivePulse() {
           boxShadow: "0 0 8px rgba(79, 195, 247, 0.4)",
         }}
       />
-      Systematic FX Signals
+      FX Intelligence Provider
     </span>
   );
 }
@@ -340,9 +340,9 @@ export default function Home() {
               marginBottom: 28,
             }}
           >
-            Quantitative edge
+            Forecasting where price
             <br />
-            <span style={{ color: "#4fc3f7" }}>for FX markets</span>
+            <span style={{ color: "#4fc3f7" }}>can go, not just direction</span>
           </motion.h1>
 
           <motion.p
@@ -359,9 +359,10 @@ export default function Home() {
               margin: "0 auto 48px",
             }}
           >
-            LumenY delivers systematic, data-driven directional signals
-            across major and cross FX pairs — built for institutional
-            desks seeking independent alpha generation.
+            LumenY delivers quantitative Maximum Favorable Excursion
+            forecasts on FX pairs — enriched with macro bias insights —
+            giving institutional desks a probabilistic view of where
+            price can move over the next 72 hours.
           </motion.p>
 
           <motion.div
@@ -487,9 +488,9 @@ export default function Home() {
             }}
             className="section-heading"
           >
-            Systematic intelligence,
+            Beyond direction —
             <br />
-            not discretion
+            magnitude intelligence
           </h2>
           <p
             style={{
@@ -501,10 +502,11 @@ export default function Home() {
               marginBottom: 64,
             }}
           >
-            Our model processes high-dimensional market data through a
-            purely mathematical framework to generate directional probability
-            signals across major and cross currency pairs. No discretionary
-            overlay, no narrative bias — only rigorous quantitative analysis.
+            Most FX intelligence tells you which way. LumenY tells you
+            how far. Our model forecasts Maximum Favorable Excursion — the
+            realistic price range a pair can reach over a 72-hour window —
+            layered with macro-driven long/short bias. Pure quantitative
+            output, no discretionary overlay.
           </p>
         </motion.div>
 
@@ -518,18 +520,18 @@ export default function Home() {
         >
           {[
             {
-              title: "High-Dimensional",
-              desc: "Each signal is derived from a dense feature space engineered to capture market dynamics invisible to conventional analysis.",
+              title: "MFE Forecasting",
+              desc: "We quantify how far price can realistically move — not just whether it goes up or down. Each forecast delivers a probabilistic excursion target over a 72-hour horizon.",
               icon: "◎",
             },
             {
-              title: "FX Coverage",
-              desc: "Active signal generation across major pairs and select crosses — EURUSD, GBPUSD, AUDUSD, USDJPY, EURGBP, and more.",
+              title: "Macro Bias Layer",
+              desc: "MFE forecasts are enriched with a macro-driven long/short bias, giving context to the directional opportunity within each signal.",
               icon: "⬡",
             },
             {
-              title: "Mathematical Rigor",
-              desc: "Built on a statistical learning framework — every signal is a probability, every decision is model-driven. No heuristics, no intuition.",
+              title: "Pure Information",
+              desc: "LumenY provides intelligence only — no execution, no fund management, no advisory. How the information is used remains entirely at the client's discretion.",
               icon: "◇",
             },
           ].map((item, i) => (
@@ -624,9 +626,9 @@ export default function Home() {
               marginBottom: 16,
             }}
           >
-            Key metrics from a systematic trading test conducted from
-            September 2025 to March 2026 across multiple FX pairs using
-            LumenY signals.
+            Model evaluation metrics from live market data across 15 FX pairs,
+            October 2025 to April 2026. Figures reflect actual price excursions
+            measured against model forecasts.
           </p>
           <p
             style={{
@@ -638,8 +640,9 @@ export default function Home() {
               marginBottom: 64,
             }}
           >
-            Past performance is not indicative of future results. These figures
-            reflect a controlled test environment, not live client returns.
+            Past results are not indicative of future performance. Figures reflect
+            model evaluation on live data, not client returns. LumenY provides
+            information only — not financial advice.
           </p>
         </motion.div>
 
@@ -652,9 +655,9 @@ export default function Home() {
             marginBottom: 16,
           }}
         >
-          <StatCard label="Return" value={26.56} suffix="%" decimals={2} prefix="+" note="Over test period" i={1} />
-          <StatCard label="Win Rate" value={65.1} suffix="%" decimals={1} note="446 / 685 trades" i={2} />
-          <StatCard label="Sharpe Ratio" value={8.02} decimals={2} note="Annualized" i={3} />
+          <StatCard label="Actual MFE ≥ 50p" value={95.9} suffix="%" decimals={1} note="Out of 462 signals" i={1} />
+          <StatCard label="Actual MFE ≥ 70p" value={85.5} suffix="%" decimals={1} note="Out of 462 signals" i={2} />
+          <StatCard label="Actual MFE ≥ 100p" value={67.7} suffix="%" decimals={1} note="Out of 462 signals" i={3} />
         </div>
         <div
           className="stats-grid-2"
@@ -665,8 +668,8 @@ export default function Home() {
             marginBottom: 32,
           }}
         >
-          <StatCard label="Profit Factor" value={2.18} decimals={2} note="Gross profit / gross loss" i={4} />
-          <StatCard label="Max Drawdown" value={1.55} suffix="%" decimals={2} note="Peak-to-trough" i={5} />
+          <StatCard label="Median Actual MFE" value={124.1} suffix="p" decimals={1} note="Across all signals (best direction)" i={4} />
+          <StatCard label="Model Conservatism" value={98.3} suffix="%" decimals={1} note="Actual exceeds forecast" i={5} />
         </div>
 
         <div
@@ -697,15 +700,15 @@ export default function Home() {
                 marginBottom: 20,
               }}
             >
-              Test Information
+              Evaluation Details
             </div>
             <div className="info-inner-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
               {[
-                { k: "Period", v: "Sep 2025 – Mar 2026" },
+                { k: "Period", v: "Oct 2025 – Apr 2026" },
                 { k: "Pairs", v: "15 FX pairs" },
-                { k: "Avg. trades / day", v: "3.4" },
-                { k: "Total trades", v: "685" },
-                { k: "Leverage", v: "50:1" },
+                { k: "Total signals", v: "462" },
+                { k: "Forecast horizon", v: "72 hours" },
+                { k: "Data", v: "Live market data" },
               ].map(({ k, v }) => (
                 <div key={k}>
                   <div
@@ -757,13 +760,13 @@ export default function Home() {
                 marginBottom: 20,
               }}
             >
-              Signal Characteristics
+              Forecast Characteristics
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {[
-                { label: "Avg. Win / Avg. Loss", value: "1.17x" },
+                { label: "Avg. actual MFE (best dir.)", value: "+148.6p" },
                 { label: "Consistency", value: "Positive across all test months" },
-                { label: "Methodology", value: "Fully systematic, zero discretion" },
+                { label: "Output type", value: "Probabilistic excursion + macro bias" },
               ].map(({ label, value }) => (
                 <div
                   key={label}
@@ -875,8 +878,8 @@ export default function Home() {
             }}
           >
             We work with institutional desks, funds, and systematic
-            trading teams. Reach out to discuss signal integration
-            and delivery.
+            trading teams. Reach out to discuss how LumenY forecasts
+            can integrate into your process.
           </motion.p>
 
           <motion.div

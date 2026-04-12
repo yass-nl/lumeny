@@ -1,8 +1,8 @@
 """
 Download models from Cloudflare R2 (private bucket) to the local volume.
-Runs once at container startup if models are not already present.
+Runs once at container startup.
 
-v6.0: 3 quantile models (Q25/Q50/Q75) + 1 meta-model.
+v7.0: Single MFE Q50 model.
 """
 
 import os
@@ -12,21 +12,17 @@ from pathlib import Path
 MODELS_DIR = Path("/app/models")
 
 FILES = [
-    "model_1H_Q25.joblib",
     "model_1H_Q50.joblib",
-    "model_1H_Q75.joblib",
-    "meta_confidence.joblib",
 ]
 
 
 def download():
-    # Always re-download to ensure latest models from R2
     print(f"Downloading {len(FILES)} model(s) from R2...")
 
     account_id = os.environ["R2_ACCOUNT_ID"]
     access_key = os.environ["R2_ACCESS_KEY_ID"]
     secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
-    bucket = os.environ.get("R2_BUCKET", "lumeny-models")
+    bucket     = os.environ.get("R2_BUCKET", "lumeny-models")
 
     s3 = boto3.client(
         "s3",

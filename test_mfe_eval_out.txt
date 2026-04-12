@@ -1,0 +1,182 @@
+Loading MFE model...
+  320 features, 423 iters
+Fetching 2025-09-01 -> 2026-04-09
+  EURUSD... 224,214 1m / 3759 1h bars
+  GBPUSD... 223,319 1m / 3759 1h bars
+  USDJPY... 223,520 1m / 3759 1h bars
+  USDCHF... 223,209 1m / 3759 1h bars
+  AUDUSD... 222,855 1m / 3728 1h bars
+  USDCAD... 224,879 1m / 3759 1h bars
+  NZDUSD... 224,795 1m / 3758 1h bars
+  EURJPY... 222,093 1m / 3738 1h bars
+  GBPJPY... 221,504 1m / 3728 1h bars
+  EURGBP... 224,544 1m / 3759 1h bars
+  EURAUD... 225,032 1m / 3759 1h bars
+  AUDJPY... 225,057 1m / 3759 1h bars
+  CADJPY... 225,042 1m / 3759 1h bars
+  CHFJPY... 225,055 1m / 3759 1h bars
+  AUDNZD... 225,068 1m / 3759 1h bars
+
+Test window: 2025-10-11 -> 2026-04-09
+
+Computing cross-pair features...
+Computing per-pair features...
+  EURUSD... 3755 rows
+  GBPUSD... 3745 rows
+  USDJPY... 3750 rows
+  USDCHF... 3742 rows
+  AUDUSD... 3725 rows
+  USDCAD... 3756 rows
+  NZDUSD... 3756 rows
+  EURJPY... 3730 rows
+  GBPJPY... 3720 rows
+  EURGBP... 3756 rows
+  EURAUD... 3756 rows
+  AUDJPY... 3756 rows
+  CADJPY... 3756 rows
+  CHFJPY... 3756 rows
+  AUDNZD... 3756 rows
+
+Scoring all bars...
+  Total candidate bars: 462
+
+================================================================================
+  MFE MODEL EVALUATION — LIVE DATA
+  Predicted Q50 >= 30.0p | Actual MFE over 72h (uncapped, both dirs) | No direction filter
+  Period: 2025-10-12 to 2026-04-09  |  N=462
+================================================================================
+
+--- Overall (all bars q50_mfe >= 30.0) ---
+  N                         : 462
+  Predicted Q50 avg         :   +45.0p   median=  +40.2p
+  Actual MFE (best dir) avg :  +148.6p   median= +124.1p
+  Actual MFE (long)    avg  :   +90.4p   median=  +74.9p
+  Actual MFE (short)   avg  :  +104.5p   median=  +75.7p
+  Pred >= actual (best)     : 98.3%   (model conservative?)
+  Actual >= 50p (best)      : 95.9%
+  Actual >= 70p (best)      : 85.5%
+  Actual >= 100p (best)     : 67.7%
+
+--- By prediction bucket ---
+  Bucket                 N   Pred_avg   Act_best   Act_long   Act_short   >=50p   >=70p   >=100p
+  ------------------------------------------------------------------------------------------
+  30-50p               320      +37.1     +133.1      +79.1       +92.7   94.4%   82.5%    61.6%
+  50-70p               112      +57.7     +170.5     +123.1      +110.3   99.1%   92.9%    82.1%
+  70-100p               28      +79.1     +235.0      +85.3      +213.1  100.0%   89.3%    78.6%
+  100-150p               2     +117.5     +182.2     +132.5      +141.3  100.0%  100.0%   100.0%
+
+--- Deep dive: q50_mfe >= 70 (N=30) ---
+  Pred avg / median         :   +81.6p  /    +77.3p
+  Actual best avg / median  :  +231.4p  /   +168.3p
+  Actual long avg / median  :   +88.4p  /    +74.8p
+  Actual short avg / median :  +208.3p  /   +143.7p
+  Model is conservative     : 86.7%  (pred < actual_best)
+  Actual best >= pred       : 86.7%
+  Actual best >= 70p        : 90.0%
+  Actual best >= 100p       : 80.0%
+  Actual best >= 150p       : 60.0%
+  Actual best percentiles   : p10=73  p25=121  p50=168  p75=240  p90=293  p95=483
+
+--- Per-pair (q50_mfe >= 70) ---
+  Pair           N   Pred_avg   Act_best   Act_long   Act_short   >=70p%
+  ----------------------------------------------------------------------
+  AUDNZD         1      +74.6      +94.1      +94.1       +76.3   100.0%
+  CADJPY         1      +81.5      +56.4      +56.4       +52.2     0.0%
+  CHFJPY        14      +80.9     +282.9     +111.5      +246.3    92.9%
+  EURAUD         5      +77.8     +247.3      +43.5      +247.3   100.0%
+  EURJPY         2      +82.1     +126.1      +93.4       +93.2   100.0%
+  GBPJPY         6      +88.4     +211.6      +78.4      +196.3    83.3%
+  USDJPY         1      +76.3      +73.9      +65.9       +73.9   100.0%
+
+--- Calibration: predicted vs actual (q50_mfe >= 70) ---
+  Avg (pred - actual_best)  :  -149.8p  (+ = model overestimates)
+  Avg (pred - actual_long)  :    -6.8p
+  Avg (pred - actual_short) :  -126.7p
+  Correlation pred/act_best :  +0.097
+  Correlation pred/act_long :  +0.225
+
+--- Monthly calibration (q50_mfe >= 70) ---
+  Month        N   Pred_avg   Act_best      Bias   >=70p%
+  -------------------------------------------------------
+  2025-10      3      +78.1     +115.8     -37.7   100.0%
+  2025-12      1      +76.5      +67.9      +8.6     0.0%
+  2026-01      8      +88.6     +167.9     -79.3   100.0%
+  2026-02      8      +76.6     +238.2    -161.5   100.0%
+  2026-03      8      +82.1     +387.8    -305.8    87.5%
+  2026-04      2      +79.5      +88.5      -9.1    50.0%
+
+================================================================================
+
+================================================================================
+  SHAP ANALYSIS — what drives high MFE predictions (q50_mfe >= 70, N=30)
+================================================================================
+Computing SHAP values...
+
+--- Top 30 features by mean |SHAP| ---
+  Feature                                       Mean|SHAP|   Mean SHAP   % positive
+  --------------------------------------------------------------------------------
+  atr_24                                           +33.448     +33.448      100.0%
+  atr_72                                            +5.346      +5.346      100.0%
+  range_width_24                                    +1.604      +1.463       93.3%
+  hour_sin                                          +1.285      +0.261       43.3%
+  atr_6                                             +0.824      +0.694       93.3%
+  range_width_5d                                    +0.805      +0.768       90.0%
+  range_width_48                                    +0.804      +0.717       76.7%
+  dow_sin                                           +0.736      +0.175       26.7%
+  vol_regime_5d                                     +0.515      +0.211       60.0%
+  range_return_ratio                                +0.499      +0.387       46.7%
+  kyle_lambda_change                                +0.359      +0.222       43.3%
+  dist_from_24h_low                                 +0.340      -0.116       70.0%
+  hour_cos                                          +0.332      +0.062       63.3%
+  dow_cos                                           +0.307      +0.159       50.0%
+  days_to_friday                                    +0.296      +0.134       46.7%
+  rv_zscore_24                                      +0.283      +0.121       76.7%
+  atr_ratio_6_24                                    +0.249      +0.140       80.0%
+  vr_5_ma12                                         +0.244      -0.141       63.3%
+  corr_usdcad_1w                                    +0.237      +0.223       83.3%
+  vol_regime_10d                                    +0.200      +0.110       46.7%
+  volume_cv                                         +0.192      +0.173       70.0%
+  rv_yang_zhang_delta_6h                            +0.162      +0.017       46.7%
+  corr_usdcad_24h                                   +0.148      +0.135       90.0%
+  entropy_returns                                   +0.146      +0.097        3.3%
+  rv_rogers_satchell                                +0.144      +0.093       60.0%
+  dist_from_24h_high                                +0.138      -0.045       46.7%
+  vpin_12h                                          +0.117      -0.012       26.7%
+  beta_chfjpy_24h                                   +0.113      +0.109       90.0%
+  volume_ratio_24                                   +0.111      +0.050       53.3%
+  is_ny                                             +0.105      +0.024       40.0%
+
+--- Feature category breakdown (sum of mean |SHAP|) ---
+  Category      Sum|SHAP|   % total   N_feats
+  ---------------------------------------------
+  atr              39.912     73.4%         5
+  other             7.426     13.7%        94
+  calendar          1.920      3.5%         5
+  momentum          1.215      2.2%        50
+  corr              1.213      2.2%        62
+  volume            1.139      2.1%        10
+  beta              0.575      1.1%        28
+  peer              0.445      0.8%        42
+  csi               0.410      0.8%        24
+  relstr            0.093      0.2%        42
+
+--- Features that consistently INCREASE predicted MFE (mean SHAP > 0, top 15) ---
+  Feature                                        Mean SHAP   % positive   Raw avg value
+  -------------------------------------------------------------------------------------
+  atr_24                                           +33.448      100.0%         43.0809
+  atr_72                                            +5.346      100.0%         37.8055
+  range_width_24                                    +1.463       93.3%        243.1794
+  range_width_5d                                    +0.768       90.0%          3.3721
+  range_width_48                                    +0.717       76.7%        305.8685
+  atr_6                                             +0.694       93.3%         41.3286
+  range_return_ratio                                +0.387       46.7%          0.3464
+  hour_sin                                          +0.261       43.3%         -0.0271
+  corr_usdcad_1w                                    +0.223       83.3%         -0.0107
+  kyle_lambda_change                                +0.222       43.3%         -0.0000
+  vol_regime_5d                                     +0.211       60.0%          1.1445
+  dow_sin                                           +0.175       26.7%          0.0000
+  volume_cv                                         +0.173       70.0%          0.1773
+  dow_cos                                           +0.159       50.0%          0.2873
+  atr_ratio_6_24                                    +0.140       80.0%          0.9520
+
+================================================================================

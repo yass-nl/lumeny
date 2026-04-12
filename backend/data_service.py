@@ -186,7 +186,7 @@ class CandleBuffer:
                 if not df_1h.empty:
                     df_1h = df_1h[~((df_1h.index.dayofweek == 5) |
                                     ((df_1h.index.dayofweek == 6) & (df_1h.index.hour < 21)))]
-                    df_1h = df_1h[df_1h.index + timedelta(minutes=60) <= now_naive]
+                    df_1h = df_1h[df_1h.index <= now_naive]
                     self.buffers[pair]['1H'] = df_1h
                 else:
                     logger.warning(f'    {pair} 1H: no data')

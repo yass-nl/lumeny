@@ -187,70 +187,114 @@ def build_dirs_tight(df_cands, pair_col):
     dirs = dirs.where(~other_pairs, np.nan)
     return dirs
 
-# ── Pair-specific rules — RELAXED version ────────────────────────────────────
+# ── Pair-specific rules — RELAXED version (v1) ───────────────────────────────
 def build_dirs_relaxed(df_cands, pair_col):
     dirs = pd.Series(np.nan, index=df_cands.index)
-
-    # USDJPY → always SHORT
     dirs = dirs.where(pair_col != 'USDJPY', -1.0)
-
-    # AUDUSD → LONG if beta_gbpusd_1w > 0.775 OR atr_24 < 40.8 (loosened: OR instead of AND)
     audusd_mask = pair_col == 'AUDUSD'
     audusd_long = audusd_mask & (df_cands['beta_gbpusd_1w'].gt(0.775) | df_cands['atr_24'].lt(40.8))
     dirs = dirs.where(~audusd_long, 1.0).where(~(audusd_mask & ~audusd_long), np.nan)
-
-    # GBPUSD → LONG if csi_usd_24h < p50 (≈0.004, was p25 = -0.007)
     gbpusd_mask = pair_col == 'GBPUSD'
     gbpusd_long = gbpusd_mask & df_cands['csi_usd_24h'].lt(0.004)
     dirs = dirs.where(~gbpusd_long, 1.0).where(~(gbpusd_mask & ~gbpusd_long), np.nan)
-
-    # EURUSD → LONG if corr_audusd_24h < 0.22 (p50, was p25=-0.10)
-    #          removed vol_regime condition entirely
     eurusd_mask = pair_col == 'EURUSD'
     eurusd_long = eurusd_mask & df_cands['corr_audusd_24h'].lt(0.22)
     dirs = dirs.where(~eurusd_long, 1.0).where(~(eurusd_mask & ~eurusd_long), np.nan)
-
-    # NZDUSD → LONG if dist_5d_high > 0.35 (was 0.55, p50 instead of p75)
     nzdusd_mask = pair_col == 'NZDUSD'
     nzdusd_long = nzdusd_mask & df_cands['dist_5d_high'].gt(0.35)
     dirs = dirs.where(~nzdusd_long, 1.0).where(~(nzdusd_mask & ~nzdusd_long), np.nan)
-
-    # USDCHF → LONG if corr_eurusd_1w > -0.60 (widened from -0.40)
     usdchf_mask = pair_col == 'USDCHF'
     usdchf_long = usdchf_mask & df_cands['corr_eurusd_1w'].gt(-0.60)
     dirs = dirs.where(~usdchf_long, 1.0).where(~(usdchf_mask & ~usdchf_long), np.nan)
-
-    # CHFJPY → LONG if corr_usdjpy_1w > 0.40 (was tight band 0.52-0.68, now just > median)
-    #        → SHORT if corr_usdjpy_1w < 0.26
     chfjpy_mask  = pair_col == 'CHFJPY'
     chfjpy_long  = chfjpy_mask & df_cands['corr_usdjpy_1w'].gt(0.40)
     chfjpy_short = chfjpy_mask & df_cands['corr_usdjpy_1w'].lt(0.26)
     dirs = dirs.where(~chfjpy_long, 1.0).where(~chfjpy_short, -1.0).where(~(chfjpy_mask & ~chfjpy_long & ~chfjpy_short), np.nan)
-
-    # CADJPY → LONG if vol_trend < 1.15 (was 0.96), SHORT if vol_trend > 1.15
-    # Simplified: just split on median
     cadjpy_mask  = pair_col == 'CADJPY'
     cadjpy_long  = cadjpy_mask & df_cands['vol_trend'].lt(1.15)
     cadjpy_short = cadjpy_mask & df_cands['vol_trend'].ge(1.15)
     dirs = dirs.where(~cadjpy_long, 1.0).where(~cadjpy_short, -1.0)
-
-    # AUDJPY → LONG if beta_usdjpy_1w > 1.14 (top quartile from analysis, 96% LONG)
     audjpy_mask = pair_col == 'AUDJPY'
     audjpy_long = audjpy_mask & df_cands['beta_usdjpy_1w'].gt(1.14)
     dirs = dirs.where(~audjpy_long, 1.0).where(~(audjpy_mask & ~audjpy_long), np.nan)
-
-    # EURJPY → LONG if beta_eurusd_1w > 0.63 (top quartile = 90% LONG, +162p)
     eurjpy_mask = pair_col == 'EURJPY'
     eurjpy_long = eurjpy_mask & df_cands['beta_eurusd_1w'].gt(0.63)
     dirs = dirs.where(~eurjpy_long, 1.0).where(~(eurjpy_mask & ~eurjpy_long), np.nan)
-
-    other_pairs = ~pair_col.isin(['USDJPY','AUDUSD','GBPUSD','EURUSD','NZDUSD',
-                                   'USDCHF','CHFJPY','CADJPY','AUDJPY','EURJPY'])
+    other_pairs = ~pair_col.isin(['USDJPY','AUDUSD','GBPUSD','EURUSD','NZDUSD','USDCHF','CHFJPY','CADJPY','AUDJPY','EURJPY'])
     dirs = dirs.where(~other_pairs, np.nan)
     return dirs
 
-df_cands['pair_specific_dir']         = build_dirs_tight(df_cands, pair_col)
-df_cands['pair_specific_relaxed_dir'] = build_dirs_relaxed(df_cands, pair_col)
+# ── Pair-specific rules — VERY RELAXED version (v2) ──────────────────────────
+# Push every threshold to p50 or remove entirely; open up remaining pairs
+def build_dirs_very_relaxed(df_cands, pair_col):
+    dirs = pd.Series(np.nan, index=df_cands.index)
+
+    # USDJPY → always SHORT (structural, keep)
+    dirs = dirs.where(pair_col != 'USDJPY', -1.0)
+
+    # AUDUSD → always LONG (78% bias, just take all signals)
+    dirs = dirs.where(pair_col != 'AUDUSD', 1.0)
+
+    # GBPUSD → always LONG (74% bias)
+    dirs = dirs.where(pair_col != 'GBPUSD', 1.0)
+
+    # EURUSD → LONG if corr_audusd_24h < p75 (0.64, very wide)
+    eurusd_mask = pair_col == 'EURUSD'
+    eurusd_long = eurusd_mask & df_cands['corr_audusd_24h'].lt(0.64)
+    dirs = dirs.where(~eurusd_long, 1.0).where(~(eurusd_mask & ~eurusd_long), np.nan)
+
+    # NZDUSD → LONG if dist_5d_high > 0.20 (very loose, just not at 5d lows)
+    nzdusd_mask = pair_col == 'NZDUSD'
+    nzdusd_long = nzdusd_mask & df_cands['dist_5d_high'].gt(0.20)
+    dirs = dirs.where(~nzdusd_long, 1.0).where(~(nzdusd_mask & ~nzdusd_long), np.nan)
+
+    # USDCHF → always LONG (55% bias + atr_24 > p75 = 100% LONG, but let all fire)
+    dirs = dirs.where(pair_col != 'USDCHF', 1.0)
+
+    # CHFJPY → LONG if corr_usdjpy_1w > 0.26 (just exclude the confirmed SHORT zone)
+    #        → SHORT if corr_usdjpy_1w < 0.26
+    chfjpy_mask  = pair_col == 'CHFJPY'
+    chfjpy_long  = chfjpy_mask & df_cands['corr_usdjpy_1w'].ge(0.26)
+    chfjpy_short = chfjpy_mask & df_cands['corr_usdjpy_1w'].lt(0.26)
+    dirs = dirs.where(~chfjpy_long, 1.0).where(~chfjpy_short, -1.0)
+
+    # CADJPY → LONG if vol_trend < 1.27 (p75), SHORT if > 1.27
+    cadjpy_mask  = pair_col == 'CADJPY'
+    cadjpy_long  = cadjpy_mask & df_cands['vol_trend'].lt(1.27)
+    cadjpy_short = cadjpy_mask & df_cands['vol_trend'].ge(1.27)
+    dirs = dirs.where(~cadjpy_long, 1.0).where(~cadjpy_short, -1.0)
+
+    # AUDJPY → LONG if beta_usdjpy_1w > 0.74 (p25, was p75=1.14)
+    audjpy_mask = pair_col == 'AUDJPY'
+    audjpy_long = audjpy_mask & df_cands['beta_usdjpy_1w'].gt(0.74)
+    dirs = dirs.where(~audjpy_long, 1.0).where(~(audjpy_mask & ~audjpy_long), np.nan)
+
+    # EURJPY → LONG if beta_eurusd_1w > 0.38 (p50, was 0.63)
+    eurjpy_mask = pair_col == 'EURJPY'
+    eurjpy_long = eurjpy_mask & df_cands['beta_eurusd_1w'].gt(0.38)
+    dirs = dirs.where(~eurjpy_long, 1.0).where(~(eurjpy_mask & ~eurjpy_long), np.nan)
+
+    # GBPJPY → LONG if corr_usdjpy_3d > 0.68 (p25 from analysis)
+    gbpjpy_mask = pair_col == 'GBPJPY'
+    gbpjpy_long = gbpjpy_mask & df_cands['corr_usdjpy_3d'].gt(0.68)
+    dirs = dirs.where(~gbpjpy_long, 1.0).where(~(gbpjpy_mask & ~gbpjpy_long), np.nan)
+
+    # AUDNZD → LONG if corr_audjpy_1w < 0.23 (low corr = AUD independent = bullish NZD divergence)
+    audnzd_mask = pair_col == 'AUDNZD'
+    audnzd_long = audnzd_mask & df_cands['corr_audjpy_1w'].lt(0.23)
+    dirs = dirs.where(~audnzd_long, 1.0).where(~(audnzd_mask & ~audnzd_long), np.nan)
+
+    # EURAUD → LONG if csi_eur_72h < p25 (EUR weak = EURAUD bullish — wait, EUR weak = EURAUD falls)
+    # From analysis: csi_eur_72h < p25 → 61.5% LONG, +38p. Keep.
+    euraud_mask = pair_col == 'EURAUD'
+    euraud_long = euraud_mask & df_cands['csi_eur_72h'].lt(-0.002)
+    dirs = dirs.where(~euraud_long, 1.0).where(~(euraud_mask & ~euraud_long), np.nan)
+
+    return dirs
+
+df_cands['pair_specific_dir']              = build_dirs_tight(df_cands, pair_col)
+df_cands['pair_specific_relaxed_dir']      = build_dirs_relaxed(df_cands, pair_col)
+df_cands['pair_specific_very_relaxed_dir'] = build_dirs_very_relaxed(df_cands, pair_col)
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -322,12 +366,13 @@ def stats(tr, label=''):
 
 # ── Run all simulations ───────────────────────────────────────────────────────
 print('\nSimulating...')
-tr_long     = simulate(df_cands, 'long',                    'Always LONG')
-tr_short    = simulate(df_cands, 'short',                   'Always SHORT')
-tr_random   = simulate(df_cands, 'random',                  'Random direction')
-tr_usd      = simulate(df_cands, 'usd_strength_dir',        'USD Strength (universal)')
-tr_tight    = simulate(df_cands, 'pair_specific_dir',       'Pair-specific TIGHT')
-tr_relaxed  = simulate(df_cands, 'pair_specific_relaxed_dir','Pair-specific RELAXED')
+tr_long          = simulate(df_cands, 'long',                         'Always LONG')
+tr_short         = simulate(df_cands, 'short',                        'Always SHORT')
+tr_random        = simulate(df_cands, 'random',                       'Random direction')
+tr_usd           = simulate(df_cands, 'usd_strength_dir',             'USD Strength (universal)')
+tr_tight         = simulate(df_cands, 'pair_specific_dir',            'Pair-specific TIGHT')
+tr_relaxed       = simulate(df_cands, 'pair_specific_relaxed_dir',    'Pair-specific RELAXED')
+tr_very_relaxed  = simulate(df_cands, 'pair_specific_very_relaxed_dir','Pair-specific VERY RELAXED')
 
 
 # ── Results ───────────────────────────────────────────────────────────────────
@@ -336,13 +381,14 @@ print(f'  RESULTS — 72h horizon | MFE >= {MFE_THRESH} | cooldown={COOLDOWN_H}h
 print(f'{"="*80}')
 print(f'  {"Rule":<52} {"N":>5}  {"L/S"}  {"WR":>6}  {"Avg":>8}  {"PF":>7}')
 print(f'  {"-"*80}')
-stats(tr_long,    'Always LONG')
-stats(tr_short,   'Always SHORT')
-stats(tr_random,  'Random direction')
+stats(tr_long,         'Always LONG')
+stats(tr_short,        'Always SHORT')
+stats(tr_random,       'Random direction')
 print(f'  {"-"*80}')
-stats(tr_usd,     'USD Strength (universal)')
-stats(tr_tight,   'Pair-specific TIGHT')
-stats(tr_relaxed, 'Pair-specific RELAXED')
+stats(tr_usd,          'USD Strength (universal)')
+stats(tr_tight,        'Pair-specific TIGHT')
+stats(tr_relaxed,      'Pair-specific RELAXED')
+stats(tr_very_relaxed, 'Pair-specific VERY RELAXED')
 
 
 # ── Per-pair breakdown ────────────────────────────────────────────────────────
@@ -360,9 +406,10 @@ def per_pair(tr, label):
 print(f'\n{"="*80}')
 print(f'  PER-PAIR BREAKDOWN')
 print(f'{"="*80}')
-per_pair(tr_short,   'Baseline: Always SHORT')
-per_pair(tr_tight,   'Pair-specific TIGHT')
-per_pair(tr_relaxed, 'Pair-specific RELAXED')
+per_pair(tr_short,        'Baseline: Always SHORT')
+per_pair(tr_tight,        'Pair-specific TIGHT')
+per_pair(tr_relaxed,      'Pair-specific RELAXED')
+per_pair(tr_very_relaxed, 'Pair-specific VERY RELAXED')
 
 
 # ── Year-by-year ──────────────────────────────────────────────────────────────
@@ -376,7 +423,8 @@ def year_by_year(tr, label):
 print(f'\n{"="*80}')
 print(f'  YEAR-BY-YEAR')
 print(f'{"="*80}')
-year_by_year(tr_short,   'Always SHORT (baseline)')
-year_by_year(tr_usd,     'USD Strength (universal)')
-year_by_year(tr_tight,   'Pair-specific TIGHT')
-year_by_year(tr_relaxed, 'Pair-specific RELAXED')
+year_by_year(tr_short,        'Always SHORT (baseline)')
+year_by_year(tr_usd,          'USD Strength (universal)')
+year_by_year(tr_tight,        'Pair-specific TIGHT')
+year_by_year(tr_relaxed,      'Pair-specific RELAXED')
+year_by_year(tr_very_relaxed, 'Pair-specific VERY RELAXED')
