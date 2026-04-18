@@ -119,8 +119,9 @@ class CandleBuffer:
 
         # Full backfill window: 96h calendar time = enough to cover weekend gap + 25h trading data
         backfill_from = (now - timedelta(hours=candle_store.KEEP_HOURS))
-        # 1H: 30 days for entry/exit price lookup
+        # 1H: 30 days for entry/exit price lookup; use tomorrow as to_date to ensure today's latest bars are included
         from_date_1h = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+        to_date_1h   = (now + timedelta(days=1)).strftime('%Y-%m-%d')
 
         for pair in PAIRS:
             self.buffers[pair] = {}
@@ -182,11 +183,11 @@ class CandleBuffer:
             # --- 1H: still fetched from Polygon (for entry/exit prices, not features) ---
             await asyncio.sleep(0.3)
             try:
-                df_1h = await fetch_historical_bars(pair, 1, 'hour', from_date_1h, to_date)
+                df_1h = await fetch_historical_bars(pair, 1, 'hour', from_date_1h, to_date_1h)
                 if not df_1h.empty:
                     df_1h = df_1h[~((df_1h.index.dayofweek == 5) |
                                     ((df_1h.index.dayofweek == 6) & (df_1h.index.hour < 21)))]
-                    df_1h = df_1h[df_1h.index <= now_naive]
+                    df_1h = df_1h[df_1h.index + timedelta(hours=1) <= now_naive]
                     self.buffers[pair]['1H'] = df_1h
                 else:
                     logger.warning(f'    {pair} 1H: no data')

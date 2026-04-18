@@ -1,51 +1,47 @@
 """
-Signal Anatomy
-==============
-For each signal (MFE>=50, hours 7-20 UTC, direction system, 72h cooldown),
-compute a comprehensive picture of what happens inside the 72h window.
+Signal Anatomy — 8h MFE Model
+==============================
+For each signal (MFE>=30, all hours, 8h cooldown),
+compute a comprehensive picture of what happens inside the 8h window.
+
+No direction system — this is purely about what the MFE model identifies:
+bars where price will make a large excursion (in either direction) within 8h.
 
 Metrics computed per signal:
   Price path:
-    - MFE  : max favorable excursion (pips) in 72h
-    - MAE  : max adverse excursion (pips) in 72h
-    - Final: final 72h return (pips)
+    - MFE  : max favorable excursion (pips) in 8h — max(up, down)
+    - MAE  : max adverse excursion — min(up, down) (opposite side to MFE)
+    - Final: net 8h return (pips, unsigned — abs)
     - MFE/MAE ratio
-    - Time-to-MFE, Time-to-MAE (hour index 0-71)
-    - MFE before MAE? (favorable move comes first)
-    - Monotonicity: fraction of hours price moved in signal direction
+    - Time-to-MFE, Time-to-MAE (hour index 0-7)
+    - MFE before MAE?
+    - Monotonicity: fraction of hours moving toward MFE direction
 
   Moving averages at entry:
     - MA50, MA200 level at bar 0
-    - Price vs MA50, vs MA200 (above/below, distance in pips)
+    - Price vs MA50, vs MA200 (pips)
     - MA50 slope (last 10h)
-    - MA200 slope (last 10h)
     - MA50 vs MA200 (golden/death cross state)
-
-  Moving averages at exit (bar 72):
-    - MA50, MA200 level
-    - Did MA50 cross MA200 during the window?
 
   Session / timing:
     - Hour of entry
     - Day of week of entry
-    - Which session: London open (7-9), London (9-12), London/NY overlap (12-14), NY (14-17), NY close (17-20)
+    - Session bucket
 
   Volume:
-    - Entry bar volume vs 24h avg volume
-    - Avg volume during window vs avg volume before window
+    - Entry bar volume vs 24h avg
 
   Momentum at entry:
-    - Return last 1h, 4h, 12h, 24h before signal
+    - Return last 1h, 4h, 8h, 24h before signal
     - RSI-like: fraction of up bars in last 14h
-    - Price range position in last 24h (where in the range is price?)
+    - Price range position in last 24h
 
   Per-pair aggregated output:
     - Avg MFE, MAE, Final by pair
-    - Hour-by-hour avg price path (0-71h) — shape of move
-    - % of signals where MAE > 20p before MFE (tells us if wide SL needed)
-    - Distribution of time-to-MFE (when to take profit)
-    - Best SL level (MAE percentiles: p50, p75, p90)
-    - Best TP level (MFE percentiles: p50, p75, p90)
+    - Hour-by-hour avg price path (0-7h)
+    - SL sizing: MAE percentiles p25/50/75/90
+    - TP sizing: MFE percentiles p25/50/75/90
+    - % of signals where actual MFE >= predicted score
 """
 
 import numpy as np
@@ -56,13 +52,13 @@ from pathlib import Path
 SCRIPT_DIR    = Path(__file__).parent
 FEATURES_DIR  = SCRIPT_DIR / '../backend/data/features_9'
 PROCESSED_DIR = SCRIPT_DIR / '../backend/data/processed'
-MFE_MODEL_PATH = SCRIPT_DIR / '../backend/models_9/mfe_q50/model_1H_Q50.joblib'
+MFE_MODEL_PATH = SCRIPT_DIR / '../backend/models_9/mfe_q50_8h/model_1H_Q50.joblib'
 
 START_DATE    = '2024-10-11'
-MFE_THRESH    = 50.0
-HOURS_ALLOWED = set(range(7, 21))
-COOLDOWN_H    = 72
-FWD_BARS      = 72
+MFE_THRESH    = 30.0
+HOURS_ALLOWED = set(range(0, 24))   # all hours — no filter
+COOLDOWN_H    = 8
+FWD_BARS      = 8
 MA_SHORT      = 50
 MA_LONG       = 200
 
@@ -77,6 +73,7 @@ print('Loading MFE model...')
 bundle       = joblib.load(MFE_MODEL_PATH)
 mfe_model    = bundle['model']
 feature_cols = bundle['feature_cols']
+print(f'  Model: {MFE_MODEL_PATH.name}  |  features: {len(feature_cols)}  |  cv_pinball: {bundle.get("cv_pinball", "n/a"):.3f}')
 
 # ── Load features_9 ───────────────────────────────────────────────────────────
 print('Loading features_9...')
@@ -84,335 +81,274 @@ dfs = [pd.read_parquet(f) for f in sorted(FEATURES_DIR.glob('*_features.parquet'
 df  = pd.concat(dfs).sort_index()
 df  = df[df.index >= START_DATE].copy()
 
-# ── Run MFE model + hour filter ───────────────────────────────────────────────
+# ── Run MFE model ─────────────────────────────────────────────────────────────
 print('Running MFE model...')
 X = df[feature_cols].ffill().fillna(0)
 df['q50_mfe'] = mfe_model.predict(X)
 df['hour']    = pd.to_datetime(df.index).hour
-df = df[(df['q50_mfe'] >= MFE_THRESH) & df['hour'].isin(HOURS_ALLOWED)].copy()
+df = df[df['q50_mfe'] >= MFE_THRESH].copy()
+print(f'  Bars above threshold: {len(df):,}')
 
-# ── Direction rules (same as 01_direction_system_all_bars.py) ─────────────────
-def apply_direction_rules(df):
-    dirs = pd.Series(np.nan, index=df.index)
-    pair = df['pair']
-
-    dirs = dirs.where(pair != 'USDJPY', -1.0)
-
-    m = pair == 'AUDUSD'
-    lc = m & (df.get('beta_gbpusd_1w', pd.Series(np.nan, index=df.index)).gt(0.775) |
-               df.get('atr_24',         pd.Series(np.nan, index=df.index)).lt(40.8))
-    dirs = dirs.where(~lc, 1.0).where(~(m & ~lc), np.nan)
-
-    m = pair == 'GBPUSD'
-    lc = m & df.get('csi_usd_24h', pd.Series(np.nan, index=df.index)).lt(0.004)
-    dirs = dirs.where(~lc, 1.0).where(~(m & ~lc), np.nan)
-
-    m = pair == 'EURUSD'
-    lc = m & df.get('corr_audusd_24h', pd.Series(np.nan, index=df.index)).lt(0.22)
-    dirs = dirs.where(~lc, 1.0).where(~(m & ~lc), np.nan)
-
-    m = pair == 'NZDUSD'
-    lc = m & df.get('dist_5d_high', pd.Series(np.nan, index=df.index)).gt(0.35)
-    dirs = dirs.where(~lc, 1.0).where(~(m & ~lc), np.nan)
-
-    m = pair == 'USDCHF'
-    lc = m & df.get('corr_eurusd_1w', pd.Series(np.nan, index=df.index)).gt(-0.60)
-    dirs = dirs.where(~lc, 1.0).where(~(m & ~lc), np.nan)
-
-    m = pair == 'CHFJPY'
-    cv = df.get('corr_usdjpy_1w', pd.Series(np.nan, index=df.index))
-    lc = m & cv.gt(0.40); sc = m & cv.lt(0.26)
-    dirs = dirs.where(~lc, 1.0).where(~sc, -1.0).where(~(m & ~lc & ~sc), np.nan)
-
-    m = pair == 'CADJPY'
-    vt = df.get('vol_trend', pd.Series(np.nan, index=df.index))
-    lc = m & vt.lt(1.15); sc = m & vt.ge(1.15)
-    dirs = dirs.where(~lc, 1.0).where(~sc, -1.0)
-
-    m = pair == 'AUDJPY'
-    lc = m & df.get('beta_usdjpy_1w', pd.Series(np.nan, index=df.index)).gt(0.74)
-    dirs = dirs.where(~lc, 1.0).where(~(m & ~lc), np.nan)
-
-    m = pair == 'EURJPY'
-    lc = m & df.get('beta_eurusd_1w', pd.Series(np.nan, index=df.index)).gt(0.38)
-    dirs = dirs.where(~lc, 1.0).where(~(m & ~lc), np.nan)
-
-    m = pair == 'GBPJPY'
-    lc = m & df.get('beta_eurusd_1w', pd.Series(np.nan, index=df.index)).gt(0.50)
-    dirs = dirs.where(~lc, 1.0).where(~(m & ~lc), np.nan)
-
-    m = pair == 'EURAUD'
-    lc = m & df.get('corr_audusd_24h', pd.Series(np.nan, index=df.index)).lt(0.22)
-    dirs = dirs.where(~lc, 1.0).where(~(m & ~lc), np.nan)
-
-    m = pair == 'AUDNZD'
-    lc = m & df.get('corr_regime_audusd', pd.Series(np.nan, index=df.index)).gt(0.0)
-    dirs = dirs.where(~lc, 1.0).where(~(m & ~lc), np.nan)
-
-    m = pair == 'EURGBP'
-    sc = m & df.get('csi_usd_24h', pd.Series(np.nan, index=df.index)).gt(0.004)
-    dirs = dirs.where(~sc, -1.0).where(~(m & ~sc), np.nan)
-
-    dirs = dirs.where(pair != 'USDCAD', np.nan)
-    return dirs
-
-df['direction'] = apply_direction_rules(df)
-df = df[df['direction'].notna()].copy()
-
-# ── Apply 72h cooldown per pair ───────────────────────────────────────────────
+# ── Apply 8h cooldown per pair ────────────────────────────────────────────────
 print('Applying cooldown...')
-candidates = df.sort_index()
+candidates = df.sort_index().reset_index()   # 'datetime' becomes a column
 cooldown_until = {}
-kept = []
-for ts, row in candidates.iterrows():
-    p = row['pair']
+kept_idx = []
+for i, row in candidates.iterrows():
+    ts = row['datetime']
+    p  = row['pair']
     if p in cooldown_until and ts < cooldown_until[p]:
         continue
     cooldown_until[p] = ts + pd.Timedelta(hours=COOLDOWN_H)
-    kept.append(ts)
-df_sig = candidates.loc[kept].copy()
-print(f'  Signals: {len(df_sig):,}')
+    kept_idx.append(i)
+df_sig = candidates.iloc[kept_idx].set_index('datetime').copy()
+print(f'  Signals after cooldown: {len(df_sig):,}')
 
-# ── Load 1H OHLCV for all pairs ───────────────────────────────────────────────
-print('Loading 1H price data...')
-price_data = {}
+# ── Load 1H OHLCV and pre-compute rolling indicators ─────────────────────────
+print('Loading 1H price data and pre-computing indicators...')
+price_data    = {}
+indicator_data = {}
+
 for pair in PAIRS_ALL:
     fpath = PROCESSED_DIR / f'{pair}_1H.parquet'
-    if fpath.exists():
-        price_data[pair] = pd.read_parquet(fpath).sort_index()
+    if not fpath.exists():
+        continue
+    bars = pd.read_parquet(fpath).sort_index()
+    price_data[pair] = bars
+    pip = 0.01 if pair in JPY_PAIRS else 0.0001
+
+    c = bars['close']
+    h = bars['high']
+    l = bars['low']
+    v = bars['volume'] if 'volume' in bars.columns else pd.Series(np.nan, index=bars.index)
+
+    ind = pd.DataFrame(index=bars.index)
+    ind['ma50']        = c.rolling(MA_SHORT).mean()
+    ind['ma200']       = c.rolling(MA_LONG).mean()
+    ind['ma50_slope']  = (c - c.shift(10)) / pip / 10
+    ind['ret_1h']      = (c - c.shift(1)).abs() / pip
+    ind['ret_4h']      = (c - c.shift(4)).abs() / pip
+    ind['ret_8h']      = (c - c.shift(8)).abs() / pip
+    ind['ret_24h']     = (c - c.shift(24)).abs() / pip
+    # RSI-like: fraction of up bars in last 14h (shift 1 so we don't use current bar)
+    ind['rsi_raw']     = c.diff().shift(1).rolling(14).apply(lambda x: (x > 0).mean(), raw=True)
+    # Range position in last 24h
+    hi24               = h.shift(1).rolling(24).max()
+    lo24               = l.shift(1).rolling(24).min()
+    rng24              = hi24 - lo24
+    ind['range_pos_24']= (c - lo24) / rng24.replace(0, np.nan)
+    # Volume ratio
+    ind['avg_vol_24h'] = v.shift(1).rolling(24).mean()
+    ind['vol_entry']   = v
+
+    indicator_data[pair] = ind
+
+print('  Done pre-computing indicators.')
 
 # ── Compute anatomy per signal ────────────────────────────────────────────────
 print('Computing signal anatomy...')
 records = []
 
-for ts, sig in df_sig.iterrows():
-    pair      = sig['pair']
-    direction = int(sig['direction'])
-    pip       = 0.01 if pair in JPY_PAIRS else 0.0001
+for i, (ts, sig) in enumerate(df_sig.iterrows()):
+    if i % 5000 == 0:
+        print(f'  {i:,}/{len(df_sig):,}...')
+    pair = sig['pair']
+    pip  = 0.01 if pair in JPY_PAIRS else 0.0001
 
     if pair not in price_data:
         continue
     bars = price_data[pair]
+    ind  = indicator_data[pair]
 
-    # Get bars at and after signal
     future = bars[bars.index >= ts].head(FWD_BARS + 1)
     if len(future) < FWD_BARS:
         continue
 
-    entry_bar  = future.iloc[0]
+    entry_bar   = future.iloc[0]
     entry_price = entry_bar['close']
-    window      = future.iloc[1:FWD_BARS + 1]   # bars 1..72 after entry
+    window      = future.iloc[1:FWD_BARS + 1]   # bars 1..8
 
     closes = window['close'].values
     highs  = window['high'].values
     lows   = window['low'].values
 
-    # ── Price path in pips relative to entry ─────────────────────────────────
-    path_pips = direction * (closes - entry_price) / pip   # positive = favorable
+    # ── MFE / MAE — unsigned, dominant side ──────────────────────────────────
+    move_up   = (highs.max()  - entry_price) / pip
+    move_down = (entry_price  - lows.min())  / pip
 
-    # MFE / MAE
-    if direction == 1:
-        favorable = (highs  - entry_price) / pip
-        adverse   = (entry_price - lows) / pip
+    if move_up >= move_down:
+        mfe     = move_up
+        mae     = move_down
+        mfe_dir = 1
+        t_mfe   = int(np.argmax(highs))
+        t_mae   = int(np.argmin(lows))
     else:
-        favorable = (entry_price - lows) / pip
-        adverse   = (highs - entry_price) / pip
+        mfe     = move_down
+        mae     = move_up
+        mfe_dir = -1
+        t_mfe   = int(np.argmin(lows))
+        t_mae   = int(np.argmax(highs))
 
-    mfe        = favorable.max()
-    mae        = adverse.max()
-    final_pips = path_pips[-1]
-    t_mfe      = int(favorable.argmax())
-    t_mae      = int(adverse.argmax())
-    mfe_first  = t_mfe < t_mae   # favorable move came before adverse
+    mfe_first = t_mfe < t_mae
+    final_abs = abs(closes[-1] - entry_price) / pip
 
-    # Monotonicity: fraction of hours moving in signal direction
+    # Monotonicity: fraction of bars moving toward MFE direction
     hourly_moves = np.diff(np.concatenate([[entry_price], closes]))
-    mono = (direction * hourly_moves > 0).mean()
+    mono = (mfe_dir * hourly_moves > 0).mean()
 
-    # Front-load: what fraction of final move happened in first 24h
-    if abs(final_pips) > 1:
-        front_load = path_pips[23] / final_pips if len(path_pips) > 23 else np.nan
+    # Predicted vs actual
+    predicted_score = sig['q50_mfe']
+    beat_prediction = 1 if mfe >= predicted_score else 0
+
+    # ── Indicators at entry (pre-computed, single lookup) ────────────────────
+    if ts in ind.index:
+        row = ind.loc[ts]
+        ma50_entry    = row['ma50']
+        ma200_entry   = row['ma200']
+        ma50_slope    = row['ma50_slope']
+        price_vs_ma50  = (entry_price - ma50_entry)  / pip if not np.isnan(ma50_entry)  else np.nan
+        price_vs_ma200 = (entry_price - ma200_entry) / pip if not np.isnan(ma200_entry) else np.nan
+        golden_cross_entry = 1.0 if (not np.isnan(ma50_entry) and not np.isnan(ma200_entry) and ma50_entry > ma200_entry) else (-1.0 if not np.isnan(ma50_entry) else np.nan)
+        ret_1h        = row['ret_1h']
+        ret_4h        = row['ret_4h']
+        ret_8h        = row['ret_8h']
+        ret_24h       = row['ret_24h']
+        rsi_raw       = row['rsi_raw']
+        range_pos_24  = row['range_pos_24']
+        avg_vol_24h   = row['avg_vol_24h']
+        entry_vol     = row['vol_entry']
+        vol_ratio     = entry_vol / avg_vol_24h if avg_vol_24h > 0 and not np.isnan(avg_vol_24h) else np.nan
     else:
-        front_load = np.nan
-
-    # ── Moving averages at entry ──────────────────────────────────────────────
-    history = bars[bars.index < ts].tail(MA_LONG + 20)
-    if len(history) < MA_LONG:
-        ma50_entry = ma200_entry = np.nan
-        ma50_slope = ma200_slope = np.nan
-        price_vs_ma50 = price_vs_ma200 = np.nan
-        golden_cross_entry = np.nan
-    else:
-        closes_hist = history['close'].values
-        ma50_entry  = closes_hist[-MA_SHORT:].mean()
-        ma200_entry = closes_hist[-MA_LONG:].mean()
-        ma50_slope  = (closes_hist[-1] - closes_hist[-11]) / pip / 10   # pips/bar over last 10h
-        ma200_slope = (closes_hist[-1] - closes_hist[-11]) / pip / 10
-        price_vs_ma50  = (entry_price - ma50_entry)  / pip   # positive = price above MA50
-        price_vs_ma200 = (entry_price - ma200_entry) / pip
-        golden_cross_entry = 1.0 if ma50_entry > ma200_entry else -1.0  # +1 = bullish (MA50>MA200)
-
-    # ── Moving averages at exit ───────────────────────────────────────────────
-    exit_price = closes[-1]
-    history_exit = bars[bars.index <= window.index[-1]].tail(MA_LONG + 20)
-    if len(history_exit) < MA_LONG:
-        ma50_exit = ma200_exit = np.nan
-        golden_cross_exit = np.nan
-    else:
-        ce = history_exit['close'].values
-        ma50_exit  = ce[-MA_SHORT:].mean()
-        ma200_exit = ce[-MA_LONG:].mean()
-        golden_cross_exit = 1.0 if ma50_exit > ma200_exit else -1.0
-
-    ma_cross_during = np.nan
-    if not (np.isnan(golden_cross_entry) or np.isnan(golden_cross_exit)):
-        ma_cross_during = 1.0 if golden_cross_entry != golden_cross_exit else 0.0
-
-    # ── Momentum at entry ─────────────────────────────────────────────────────
-    hist_closes = history['close'].values if len(history) >= 24 else np.array([])
-    ret_1h  = (entry_price - bars['close'].iloc[-2]) / pip if len(bars) >= 2 else np.nan
-
-    def ret_nh(n):
-        h = bars[bars.index < ts].tail(n + 1)
-        if len(h) < n + 1:
-            return np.nan
-        return (h['close'].iloc[-1] - h['close'].iloc[0]) / pip
-
-    ret_4h  = ret_nh(4)
-    ret_12h = ret_nh(12)
-    ret_24h = ret_nh(24)
-
-    # RSI-like: fraction of up bars in last 14h
-    h14 = bars[bars.index < ts].tail(15)
-    if len(h14) >= 14:
-        diffs   = np.diff(h14['close'].values)
-        rsi_raw = (diffs > 0).mean()
-    else:
-        rsi_raw = np.nan
-
-    # Range position in last 24h
-    h24 = bars[bars.index < ts].tail(24)
-    if len(h24) >= 24:
-        hi24 = h24['high'].max()
-        lo24 = h24['low'].min()
-        range24 = hi24 - lo24
-        range_pos_24 = (entry_price - lo24) / range24 if range24 > 0 else 0.5
-    else:
-        range_pos_24 = np.nan
-
-    # ── Volume at entry ───────────────────────────────────────────────────────
-    entry_vol = entry_bar.get('volume', np.nan)
-    h24v = bars[bars.index < ts].tail(24)
-    avg_vol_24h = h24v['volume'].mean() if len(h24v) > 0 else np.nan
-    vol_ratio   = entry_vol / avg_vol_24h if avg_vol_24h and avg_vol_24h > 0 else np.nan
+        ma50_entry = ma200_entry = ma50_slope = np.nan
+        price_vs_ma50 = price_vs_ma200 = golden_cross_entry = np.nan
+        ret_1h = ret_4h = ret_8h = ret_24h = rsi_raw = range_pos_24 = vol_ratio = np.nan
 
     # ── Session ───────────────────────────────────────────────────────────────
-    h = sig['hour']
-    if   7  <= h <  9: session = 'London_open'
-    elif 9  <= h < 12: session = 'London'
-    elif 12 <= h < 14: session = 'LN_NY_overlap'
-    elif 14 <= h < 17: session = 'NY'
-    else:              session = 'NY_close'
+    hr = sig['hour']
+    if   7  <= hr <  9: session = 'London_open'
+    elif 9  <= hr < 12: session = 'London'
+    elif 12 <= hr < 14: session = 'LN_NY_overlap'
+    elif 14 <= hr < 17: session = 'NY'
+    elif 17 <= hr < 21: session = 'NY_close'
+    else:               session = 'Off_hours'
 
-    dow = pd.Timestamp(ts).day_of_week   # 0=Mon, 4=Fri
+    dow = pd.Timestamp(ts).day_of_week
 
-    # ── SL/TP levels by percentile (will aggregate later) ────────────────────
+    # ── Path in dominant direction (positive = toward MFE) ───────────────────
+    path_pips = mfe_dir * (closes - entry_price) / pip
+
     records.append({
-        'ts':            ts,
-        'pair':          pair,
-        'direction':     direction,
-        'mfe_score':     sig['q50_mfe'],
-        'hour':          h,
-        'session':       session,
-        'dow':           dow,
+        'ts':              ts,
+        'pair':            pair,
+        'mfe_score':       predicted_score,
+        'hour':            hr,
+        'session':         session,
+        'dow':             dow,
         # outcome
-        'mfe':           mfe,
-        'mae':           mae,
-        'final_pips':    final_pips,
-        'correct':       1 if final_pips > 0 else 0,
-        'mfe_mae_ratio': mfe / mae if mae > 0.1 else np.nan,
-        't_mfe':         t_mfe,
-        't_mae':         t_mae,
-        'mfe_first':     int(mfe_first),
-        'monotonicity':  mono,
-        'front_load':    front_load,
-        # MAs at entry
-        'ma50_entry':    ma50_entry,
-        'ma200_entry':   ma200_entry,
-        'price_vs_ma50': price_vs_ma50,
-        'price_vs_ma200':price_vs_ma200,
-        'ma50_slope':    ma50_slope,
-        'golden_cross':  golden_cross_entry,
-        # MAs at exit
-        'ma50_exit':     ma50_exit,
-        'ma200_exit':    ma200_exit,
-        'ma_cross_during': ma_cross_during,
+        'mfe':             mfe,
+        'mae':             mae,
+        'final_abs':       final_abs,
+        'mfe_dir':         mfe_dir,
+        'mfe_mae_ratio':   mfe / mae if mae > 0.1 else np.nan,
+        't_mfe':           t_mfe,
+        't_mae':           t_mae,
+        'mfe_first':       int(mfe_first),
+        'monotonicity':    mono,
+        'beat_prediction': beat_prediction,
+        # MAs
+        'price_vs_ma50':   price_vs_ma50,
+        'price_vs_ma200':  price_vs_ma200,
+        'ma50_slope':      ma50_slope,
+        'golden_cross':    golden_cross_entry,
         # momentum
-        'ret_1h':        ret_1h,
-        'ret_4h':        ret_4h,
-        'ret_12h':       ret_12h,
-        'ret_24h':       ret_24h,
-        'rsi_raw':       rsi_raw,
-        'range_pos_24':  range_pos_24,
+        'ret_1h':          ret_1h,
+        'ret_4h':          ret_4h,
+        'ret_8h':          ret_8h,
+        'ret_24h':         ret_24h,
+        'rsi_raw':         rsi_raw,
+        'range_pos_24':    range_pos_24,
         # volume
-        'vol_ratio':     vol_ratio,
-        # path (store for per-pair avg shape)
-        '_path':         path_pips,
+        'vol_ratio':       vol_ratio,
+        # path
+        '_path':           path_pips,
     })
 
-ana = pd.DataFrame([{k: v for k, v in r.items() if k != '_path'} for r in records])
+ana   = pd.DataFrame([{k: v for k, v in r.items() if k != '_path'} for r in records])
 paths = [r['_path'] for r in records]
-
 print(f'  Computed {len(ana):,} signal anatomies')
 
 # ── Print results ─────────────────────────────────────────────────────────────
 SEP = '=' * 72
 
-def pct(x): return f'{x:.1%}'
-def pip_fmt(x): return f'{x:+.1f}p' if not np.isnan(x) else 'n/a'
-def fmt(x, dec=2): return f'{x:.{dec}f}' if not np.isnan(x) else 'n/a'
+def pct(x):    return f'{x:.1%}' if not np.isnan(x) else 'n/a'
+def p(x):      return f'{x:+.1f}p' if not np.isnan(x) else 'n/a'
+def pu(x):     return f'{x:.1f}p' if not np.isnan(x) else 'n/a'
+def fmt(x, d=2): return f'{x:.{d}f}' if not np.isnan(x) else 'n/a'
 
 print(f'\n{SEP}')
-print(f'  SIGNAL ANATOMY  —  {len(ana):,} signals  |  MFE>=50  |  hours 7-20 UTC  |  72h window')
+print(f'  SIGNAL ANATOMY  —  {len(ana):,} signals  |  MFE>=30  |  all hours  |  8h cooldown  |  8h window')
+print(f'  Model: mfe_q50_8h  |  Period: {START_DATE} to present')
 print(f'{SEP}')
 
+# ── Model calibration ─────────────────────────────────────────────────────────
+print(f'\n  MODEL CALIBRATION  (does actual MFE match the prediction?)')
+print(f'  {"Avg predicted score":<35}: {pu(ana["mfe_score"].mean())}  med={pu(ana["mfe_score"].median())}')
+print(f'  {"Avg actual MFE":<35}: {pu(ana["mfe"].mean())}  med={pu(ana["mfe"].median())}')
+print(f'  {"% signals beating prediction":<35}: {pct(ana["beat_prediction"].mean())}')
+print(f'  {"Avg over-performance":<35}: {pu((ana["mfe"] - ana["mfe_score"]).mean())}  (actual - predicted)')
+print(f'\n  Calibration by score bucket:')
+for lo, hi in [(30,40),(40,50),(50,60),(60,70),(70,90),(90,999)]:
+    sub = ana[(ana['mfe_score'] >= lo) & (ana['mfe_score'] < hi)]
+    if len(sub) < 20: continue
+    beat = sub['beat_prediction'].mean()
+    print(f'    score {lo:>3}-{hi:<4}: N={len(sub):>5}  pred={pu(sub["mfe_score"].mean())}  actual={pu(sub["mfe"].mean())}  beat={pct(beat)}')
+
 # ── Overall summary ───────────────────────────────────────────────────────────
-print(f'\n  OVERALL')
-print(f'  {"Accuracy":<30}: {pct(ana["correct"].mean())}')
-print(f'  {"Avg final":<30}: {pip_fmt(ana["final_pips"].mean())}  (med {pip_fmt(ana["final_pips"].median())})')
-print(f'  {"Avg MFE":<30}: {pip_fmt(ana["mfe"].mean())}  (med {pip_fmt(ana["mfe"].median())})')
-print(f'  {"Avg MAE":<30}: {pip_fmt(ana["mae"].mean())}  (med {pip_fmt(ana["mae"].median())})')
-print(f'  {"Avg MFE/MAE ratio":<30}: {fmt(ana["mfe_mae_ratio"].mean())}')
-print(f'  {"MFE before MAE %":<30}: {pct(ana["mfe_first"].mean())}  (favorable move comes first)')
-print(f'  {"Avg time to MFE (h)":<30}: {fmt(ana["t_mfe"].mean(), 1)}  (med {fmt(ana["t_mfe"].median(), 1)})')
-print(f'  {"Avg time to MAE (h)":<30}: {fmt(ana["t_mae"].mean(), 1)}  (med {fmt(ana["t_mae"].median(), 1)})')
-print(f'  {"Avg monotonicity":<30}: {pct(ana["monotonicity"].mean())}  (% of bars moving in signal dir)')
-print(f'  {"Avg front-load (24h/72h)":<30}: {pct(ana["front_load"].dropna().mean())}  (fraction of final move in first 24h)')
+print(f'\n{SEP}')
+print(f'  OVERALL PRICE ACTION IN 8H WINDOW')
+print(f'{SEP}')
+print(f'  {"Avg MFE (dominant side)":<35}: {pu(ana["mfe"].mean())}  med={pu(ana["mfe"].median())}')
+print(f'  {"Avg MAE (opposite side)":<35}: {pu(ana["mae"].mean())}  med={pu(ana["mae"].median())}')
+print(f'  {"Avg final move (abs)":<35}: {pu(ana["final_abs"].mean())}  med={pu(ana["final_abs"].median())}')
+print(f'  {"Avg MFE/MAE ratio":<35}: {fmt(ana["mfe_mae_ratio"].mean())}')
+print(f'  {"MFE before MAE":<35}: {pct(ana["mfe_first"].mean())}  (dominant move comes first)')
+print(f'  {"Avg time to MFE (h)":<35}: {fmt(ana["t_mfe"].mean(), 1)}  med={fmt(ana["t_mfe"].median(), 1)}')
+print(f'  {"Avg time to MAE (h)":<35}: {fmt(ana["t_mae"].mean(), 1)}  med={fmt(ana["t_mae"].median(), 1)}')
+print(f'  {"Avg monotonicity":<35}: {pct(ana["monotonicity"].mean())}  (% of bars in dominant direction)')
+print(f'  {"Up dominant":<35}: {pct((ana["mfe_dir"] == 1).mean())}  |  Down: {pct((ana["mfe_dir"] == -1).mean())}')
 
-print(f'\n  SL SIZING  (MAE percentiles — how far it goes against before recovering):')
-for p in [25, 50, 75, 90, 95]:
-    print(f'    p{p:<3}: {ana["mae"].quantile(p/100):>6.1f}p')
+print(f'\n  SL SIZING  (MAE percentiles):')
+for pv in [25, 50, 75, 90, 95]:
+    print(f'    p{pv:<3}: {ana["mae"].quantile(pv/100):>6.1f}p')
 
-print(f'\n  TP SIZING  (MFE percentiles — how far it goes in our favor):')
-for p in [25, 50, 75, 90, 95]:
-    print(f'    p{p:<3}: {ana["mfe"].quantile(p/100):>6.1f}p')
+print(f'\n  TP SIZING  (MFE percentiles):')
+for pv in [25, 50, 75, 90, 95]:
+    print(f'    p{pv:<3}: {ana["mfe"].quantile(pv/100):>6.1f}p')
 
-print(f'\n  TIME TO MFE distribution  (when does the best exit occur):')
-bins = [(0,12,'first 12h'), (12,24,'12-24h'), (24,48,'24-48h'), (48,72,'48-72h')]
-for lo, hi, label in bins:
+print(f'\n  TIME TO MFE distribution:')
+for lo, hi, label in [(0,2,'h0-2'),(2,4,'h2-4'),(4,6,'h4-6'),(6,8,'h6-8')]:
     n = ((ana['t_mfe'] >= lo) & (ana['t_mfe'] < hi)).sum()
-    print(f'    {label:<15}: {n:>5}  ({n/len(ana):.1%})')
+    print(f'    {label:<8}: {n:>6}  ({n/len(ana):.1%})')
+
+# ── MAE vs actual MFE ─────────────────────────────────────────────────────────
+print(f'\n  MAE BUCKETS vs ACTUAL MFE  (small MAE = cleaner entry?):')
+for lo, hi, label in [(0,10,'MAE<10p'),(10,20,'MAE 10-20p'),(20,40,'MAE 20-40p'),(40,999,'MAE>40p')]:
+    sub = ana[(ana['mae'] >= lo) & (ana['mae'] < hi)]
+    if len(sub) < 20: continue
+    print(f'    {label:<14}: N={len(sub):>5}  MFE={pu(sub["mfe"].mean())}  beat_pred={pct(sub["beat_prediction"].mean())}  t_mfe={fmt(sub["t_mfe"].mean(),1)}h')
 
 # ── MA context ────────────────────────────────────────────────────────────────
-print(f'\n  MA CONTEXT AT ENTRY')
+print(f'\n{SEP}')
+print(f'  MA CONTEXT AT ENTRY')
+print(f'{SEP}')
 gc = ana['golden_cross'].dropna()
-print(f'  {"Golden cross (MA50>MA200)":<35}: {pct((gc == 1).mean())}  of signals')
-print(f'  {"Death cross  (MA50<MA200)":<35}: {pct((gc == -1).mean())}  of signals')
-print(f'  {"Avg price vs MA50 (pips)":<35}: {pip_fmt(ana["price_vs_ma50"].mean())}  (+ = above MA50)')
-print(f'  {"Avg price vs MA200 (pips)":<35}: {pip_fmt(ana["price_vs_ma200"].mean())}  (+ = above MA200)')
+print(f'  {"Golden cross (MA50>MA200)":<35}: {pct((gc == 1).mean())}')
+print(f'  {"Death cross  (MA50<MA200)":<35}: {pct((gc == -1).mean())}')
+print(f'  {"Avg price vs MA50":<35}: {p(ana["price_vs_ma50"].mean())}  (+ = above MA50)')
+print(f'  {"Avg price vs MA200":<35}: {p(ana["price_vs_ma200"].mean())}')
 print(f'  {"Avg MA50 slope (p/bar)":<35}: {fmt(ana["ma50_slope"].mean(), 3)}')
 
-# Accuracy split by MA alignment
+print(f'\n  MFE by MA context:')
 for label, mask in [
     ('Price above MA50  ', ana['price_vs_ma50'] > 0),
     ('Price below MA50  ', ana['price_vs_ma50'] < 0),
@@ -423,43 +359,46 @@ for label, mask in [
 ]:
     sub = ana[mask]
     if len(sub) < 20: continue
-    print(f'    {label}: N={len(sub):>4}  acc={pct(sub["correct"].mean())}  avg={pip_fmt(sub["final_pips"].mean())}  MFE={pip_fmt(sub["mfe"].mean())}  MAE={pip_fmt(sub["mae"].mean())}')
+    print(f'    {label}: N={len(sub):>5}  MFE={pu(sub["mfe"].mean())}  MAE={pu(sub["mae"].mean())}  beat={pct(sub["beat_prediction"].mean())}')
 
 # ── Momentum context ──────────────────────────────────────────────────────────
-print(f'\n  MOMENTUM AT ENTRY (avg return before signal, in pip)')
-print(f'  {"ret_1h":<15}: {pip_fmt(ana["ret_1h"].mean())}')
-print(f'  {"ret_4h":<15}: {pip_fmt(ana["ret_4h"].mean())}')
-print(f'  {"ret_12h":<15}: {pip_fmt(ana["ret_12h"].mean())}')
-print(f'  {"ret_24h":<15}: {pip_fmt(ana["ret_24h"].mean())}')
-print(f'  {"RSI-like (14h)":<15}: {fmt(ana["rsi_raw"].mean())}  (0.5=neutral)')
-print(f'  {"Range pos 24h":<15}: {fmt(ana["range_pos_24"].mean())}  (0=at low, 1=at high)')
+print(f'\n{SEP}')
+print(f'  MOMENTUM AT ENTRY')
+print(f'{SEP}')
+print(f'  {"avg |ret_1h|":<20}: {pu(ana["ret_1h"].mean())}')
+print(f'  {"avg |ret_4h|":<20}: {pu(ana["ret_4h"].mean())}')
+print(f'  {"avg |ret_8h|":<20}: {pu(ana["ret_8h"].mean())}')
+print(f'  {"avg |ret_24h|":<20}: {pu(ana["ret_24h"].mean())}')
+print(f'  {"RSI-like (14h)":<20}: {fmt(ana["rsi_raw"].mean())}  (0.5=neutral)')
+print(f'  {"Range pos 24h":<20}: {fmt(ana["range_pos_24"].mean())}  (0=at low, 1=at high)')
 
-# Accuracy split by momentum alignment
-print(f'\n  Accuracy by momentum alignment:')
-ana['momentum_aligned'] = (ana['direction'] * ana['ret_4h'] > 0)
-for label, mask in [
-    ('4h momentum aligned   ', ana['momentum_aligned'] == True),
-    ('4h momentum counter   ', ana['momentum_aligned'] == False),
-    ('RSI-like > 0.5 (upward)', ana['rsi_raw'] > 0.5),
-    ('RSI-like < 0.5 (downward)', ana['rsi_raw'] < 0.5),
-]:
-    sub = ana[mask]
+print(f'\n  MFE by momentum magnitude (|ret_4h|):')
+for lo, hi, label in [(0,5,'<5p'),(5,15,'5-15p'),(15,30,'15-30p'),(30,999,'>30p')]:
+    sub = ana[(ana['ret_4h'] >= lo) & (ana['ret_4h'] < hi)]
     if len(sub) < 20: continue
-    print(f'    {label}: N={len(sub):>4}  acc={pct(sub["correct"].mean())}  avg={pip_fmt(sub["final_pips"].mean())}')
+    print(f'    ret_4h {label:<8}: N={len(sub):>5}  MFE={pu(sub["mfe"].mean())}  MAE={pu(sub["mae"].mean())}  beat={pct(sub["beat_prediction"].mean())}')
 
 # ── Session / timing ──────────────────────────────────────────────────────────
-print(f'\n  ACCURACY BY SESSION')
-for sess in ['London_open', 'London', 'LN_NY_overlap', 'NY', 'NY_close']:
+print(f'\n{SEP}')
+print(f'  SESSION & TIMING')
+print(f'{SEP}')
+print(f'\n  By session:')
+for sess in ['London_open','London','LN_NY_overlap','NY','NY_close','Off_hours']:
     sub = ana[ana['session'] == sess]
     if len(sub) < 10: continue
-    print(f'    {sess:<20}: N={len(sub):>4}  acc={pct(sub["correct"].mean())}  avg={pip_fmt(sub["final_pips"].mean())}  MFE={pip_fmt(sub["mfe"].mean())}  MAE={pip_fmt(sub["mae"].mean())}')
+    print(f'    {sess:<18}: N={len(sub):>5}  MFE={pu(sub["mfe"].mean())}  MAE={pu(sub["mae"].mean())}  beat={pct(sub["beat_prediction"].mean())}  t_mfe={fmt(sub["t_mfe"].mean(),1)}h')
 
-print(f'\n  ACCURACY BY DAY OF WEEK')
-days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']
-for d in range(5):
+print(f'\n  By day of week:')
+for d, name in enumerate(['Mon','Tue','Wed','Thu','Fri']):
     sub = ana[ana['dow'] == d]
     if len(sub) < 10: continue
-    print(f'    {days[d]}: N={len(sub):>4}  acc={pct(sub["correct"].mean())}  avg={pip_fmt(sub["final_pips"].mean())}')
+    print(f'    {name}: N={len(sub):>5}  MFE={pu(sub["mfe"].mean())}  MAE={pu(sub["mae"].mean())}  beat={pct(sub["beat_prediction"].mean())}')
+
+print(f'\n  By hour of day:')
+for h in range(24):
+    sub = ana[ana['hour'] == h]
+    if len(sub) < 20: continue
+    print(f'    h{h:02d}: N={len(sub):>5}  MFE={pu(sub["mfe"].mean())}  MAE={pu(sub["mae"].mean())}  beat={pct(sub["beat_prediction"].mean())}')
 
 # ── Per-pair breakdown ────────────────────────────────────────────────────────
 print(f'\n{SEP}')
@@ -472,54 +411,44 @@ for r in records:
 
 for pair in sorted(ana['pair'].unique()):
     sub = ana[ana['pair'] == pair]
-    if len(sub) < 5:
+    if len(sub) < 10:
         continue
-    print(f'\n  {pair}  N={len(sub)}  dir={int(sub["direction"].mode()[0]):+d}  acc={pct(sub["correct"].mean())}')
-    print(f'  {"":4}  {"MFE":>8}  {"MAE":>8}  {"Final":>8}  {"R:R":>6}  {"t_MFE":>7}  {"t_MAE":>7}  {"MFE1st":>7}  {"Mono":>6}')
-    print(f'  {"":4}  {"-"*66}')
-    print(f'  {"avg":4}  {sub["mfe"].mean():>8.1f}  {sub["mae"].mean():>8.1f}  {sub["final_pips"].mean():>+8.1f}  '
-          f'{sub["mfe_mae_ratio"].mean():>6.2f}  {sub["t_mfe"].mean():>7.1f}  {sub["t_mae"].mean():>7.1f}  '
-          f'{sub["mfe_first"].mean():>7.1%}  {sub["monotonicity"].mean():>6.1%}')
-    print(f'\n    SL (MAE percentiles): p25={sub["mae"].quantile(0.25):.1f}p  p50={sub["mae"].quantile(0.5):.1f}p  '
+    print(f'\n  {pair}  N={len(sub)}  beat_pred={pct(sub["beat_prediction"].mean())}')
+    print(f'    MFE={pu(sub["mfe"].mean())} (med {pu(sub["mfe"].median())})  '
+          f'MAE={pu(sub["mae"].mean())} (med {pu(sub["mae"].median())})  '
+          f'R:R={fmt(sub["mfe_mae_ratio"].mean())}  '
+          f't_mfe={fmt(sub["t_mfe"].mean(),1)}h  MFE1st={pct(sub["mfe_first"].mean())}')
+    print(f'    SL: p25={sub["mae"].quantile(0.25):.1f}p  p50={sub["mae"].quantile(0.5):.1f}p  '
           f'p75={sub["mae"].quantile(0.75):.1f}p  p90={sub["mae"].quantile(0.9):.1f}p')
-    print(f'    TP (MFE percentiles): p25={sub["mfe"].quantile(0.25):.1f}p  p50={sub["mfe"].quantile(0.5):.1f}p  '
+    print(f'    TP: p25={sub["mfe"].quantile(0.25):.1f}p  p50={sub["mfe"].quantile(0.5):.1f}p  '
           f'p75={sub["mfe"].quantile(0.75):.1f}p  p90={sub["mfe"].quantile(0.9):.1f}p')
 
-    # MA alignment
-    gc = sub['golden_cross'].dropna()
-    if len(gc) > 0:
-        print(f'    MA: golden={pct((gc==1).mean())}  price_vs_ma50={pip_fmt(sub["price_vs_ma50"].mean())}  '
-              f'price_vs_ma200={pip_fmt(sub["price_vs_ma200"].mean())}')
-
-    # Momentum
-    print(f'    Momentum: ret_4h={pip_fmt(sub["ret_4h"].mean())}  ret_24h={pip_fmt(sub["ret_24h"].mean())}  '
-          f'rsi={fmt(sub["rsi_raw"].mean())}  range_pos={fmt(sub["range_pos_24"].mean())}')
-
-    # Hour-by-hour avg path (show every 6h)
+    # Avg path in dominant direction
     pair_paths = pair_path_records[pair]
     if pair_paths:
         min_len = min(len(p) for p in pair_paths)
         arr = np.array([p[:min_len] for p in pair_paths])
         avg_path = arr.mean(axis=0)
-        checkpoints = [0, 5, 11, 17, 23, 29, 35, 41, 47, 53, 59, 65, 71]
-        checkpoints = [c for c in checkpoints if c < len(avg_path)]
-        path_str = '  '.join(f'h{c+1:02d}:{avg_path[c]:>+5.0f}p' for c in checkpoints)
+        checkpoints = [c for c in range(min_len)]
+        path_str = '  '.join(f'h{c+1}:{avg_path[c]:>+5.0f}p' for c in checkpoints)
         print(f'    Avg path: {path_str}')
 
 # ── Average path shape (all pairs combined) ───────────────────────────────────
 print(f'\n{SEP}')
-print(f'  AVG PRICE PATH — ALL SIGNALS (pips in signal direction, h1 to h72)')
+print(f'  AVG PRICE PATH — ALL SIGNALS (pips in dominant direction, h1 to h8)')
 print(f'{SEP}')
-min_len = min(len(p) for p in paths)
-all_arr = np.array([p[:min_len] for p in paths])
-avg_all = all_arr.mean(axis=0)
-print(f'\n  {"Hour":<6}  {"AvgPip":>8}  Bar')
-print(f'  {"-"*40}')
-for h in range(0, min(72, min_len), 6):
+min_len  = min(len(p) for p in paths)
+all_arr  = np.array([p[:min_len] for p in paths])
+avg_all  = all_arr.mean(axis=0)
+std_all  = all_arr.std(axis=0)
+print(f'\n  {"Hour":<6}  {"AvgPip":>8}  {"StdDev":>8}  Bar')
+print(f'  {"-"*50}')
+for h in range(min(FWD_BARS, min_len)):
     v   = avg_all[h]
-    bar = '|' * int(abs(v) / 3)
-    sign = '+' if v >= 0 else '-'
-    print(f'  h{h+1:02d}    {v:>+8.1f}  {sign}{bar}')
+    s   = std_all[h]
+    bar = '|' * int(abs(v) / 2)
+    sgn = '+' if v >= 0 else '-'
+    print(f'  h{h+1:<4}  {v:>+8.1f}  {s:>8.1f}  {sgn}{bar}')
 
 print(f'\n{SEP}')
 print(f'  DONE')

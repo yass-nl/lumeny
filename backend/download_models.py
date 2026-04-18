@@ -2,7 +2,7 @@
 Download models from Cloudflare R2 (private bucket) to the local volume.
 Runs once at container startup.
 
-v7.0: Single MFE Q50 model.
+v8.0: MFE Q50 8h model.
 """
 
 import os

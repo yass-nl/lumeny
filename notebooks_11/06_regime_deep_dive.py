@@ -25,13 +25,13 @@ from pathlib import Path
 SCRIPT_DIR     = Path(__file__).parent
 FEATURES_DIR   = SCRIPT_DIR / '../backend/data/features_9'
 PROCESSED_DIR  = SCRIPT_DIR / '../backend/data/processed'
-MFE_MODEL_PATH = SCRIPT_DIR / '../backend/models_9/mfe_q50/model_1H_Q50.joblib'
+MFE_MODEL_PATH = SCRIPT_DIR / '../backend/models_9/mfe_q50_8h/model_1H_Q50.joblib'
 
 START_DATE  = '2024-10-11'
-MFE_THRESH  = 50.0
+MFE_THRESH  = 30.0
 HOURS_ALLOWED = set(range(7, 21))
-COOLDOWN_H  = 72
-WINDOW_H    = 72
+COOLDOWN_H  = 8
+WINDOW_H    = 8
 MA_SHORT    = 50
 MA_LONG     = 200
 
@@ -109,26 +109,25 @@ def apply_direction_rules(df):
 
 df9['direction'] = apply_direction_rules(df9)
 
-# ── Two pools: MFE-only and MFE+direction ─────────────────────────────────────
+# ── Apply cooldown once to all MFE>=threshold bars, then split ────────────────
 df_mfe = df9[(df9['q50_mfe'] >= MFE_THRESH) & df9['hour'].isin(HOURS_ALLOWED)].copy()
-df_dir = df_mfe[df_mfe['direction'].notna()].copy()
 
-# Apply 72h cooldown to both pools separately
-def apply_cooldown(df):
-    cooldown = {}
-    kept = []
-    for ts, row in df.sort_index().iterrows():
-        p = row['pair']
-        if p in cooldown and ts < cooldown[p]: continue
-        cooldown[p] = ts + pd.Timedelta(hours=COOLDOWN_H)
-        kept.append(ts)
-    return df.loc[kept].copy()
+cooldown = {}
+kept_idx = []
+candidates = df_mfe.sort_index().reset_index()
+for i, row in candidates.iterrows():
+    ts = row['datetime']
+    p  = row['pair']
+    if p in cooldown and ts < cooldown[p]: continue
+    cooldown[p] = ts + pd.Timedelta(hours=COOLDOWN_H)
+    kept_idx.append(i)
+df_mfe_sig = candidates.iloc[kept_idx].set_index('datetime').copy()
 
-df_mfe_sig = apply_cooldown(df_mfe)
-df_dir_sig = apply_cooldown(df_dir)
+# Direction pool is a subset of the already-cooldown-filtered signals
+df_dir_sig = df_mfe_sig[df_mfe_sig['direction'].notna()].copy()
 
-print(f'  MFE>=50 signals:            {len(df_mfe_sig):,}')
-print(f'  MFE>=50 + direction signals: {len(df_dir_sig):,}')
+print(f'  MFE>=30 signals:            {len(df_mfe_sig):,}')
+print(f'  MFE>=30 + direction signals: {len(df_dir_sig):,}')
 
 # ── Load 1H price data ────────────────────────────────────────────────────────
 print('Loading 1H price data...')
@@ -166,44 +165,40 @@ def analyse_signals(df_sig, label, use_direction=False):
         # ── fwd_72h ──────────────────────────────────────────────────────────
         fwd_72h = (closes[-1] - entry_price) / pip
 
-        # ── MFE / MAE (raw, unsigned) ─────────────────────────────────────────
-        mfe_long  = (highs.max()  - entry_price) / pip   # best upside seen
-        mfe_short = (entry_price  - lows.min())  / pip   # best downside seen
-        mae_long  = (entry_price  - lows.min())  / pip   # worst for LONG
-        mae_short = (highs.max()  - entry_price) / pip   # worst for SHORT
+        # ── MFE / MAE — dominant side definition ─────────────────────────────
+        # MFE = largest excursion in either direction (always >= MAE)
+        # MAE = excursion on the opposite side
+        move_up   = (highs.max() - entry_price) / pip
+        move_down = (entry_price - lows.min())  / pip
 
-        # Hour of MFE / MAE (for long and short)
-        t_mfe_long  = int(np.argmax(highs))
-        t_mfe_short = int(np.argmin(lows))
-        t_mae_long  = int(np.argmin(lows))
-        t_mae_short = int(np.argmax(highs))
+        if move_up >= move_down:
+            mfe_val   = move_up
+            mae_val   = move_down
+            t_mfe_val = int(np.argmax(highs))
+            t_mae_val = int(np.argmin(lows))
+        else:
+            mfe_val   = move_down
+            mae_val   = move_up
+            t_mfe_val = int(np.argmin(lows))
+            t_mae_val = int(np.argmax(highs))
 
         # ── Directional outcome ───────────────────────────────────────────────
         if use_direction and not np.isnan(direction):
             dir_int    = int(direction)
             fwd_signed = dir_int * fwd_72h
-            mfe_val    = mfe_long  if dir_int == 1 else mfe_short
-            mae_val    = mae_long  if dir_int == 1 else mae_short
-            t_mfe_val  = t_mfe_long  if dir_int == 1 else t_mfe_short
-            t_mae_val  = t_mae_long  if dir_int == 1 else t_mae_short
             correct    = 1 if fwd_signed > 0 else 0
         else:
             dir_int    = np.nan
             fwd_signed = np.nan
-            mfe_val    = max(mfe_long, mfe_short)
-            mae_val    = min(mae_long, mae_short)   # lesser adverse
-            t_mfe_val  = t_mfe_long if mfe_long >= mfe_short else t_mfe_short
-            t_mae_val  = t_mae_long if mae_long <= mae_short else t_mae_short
             correct    = np.nan
 
         # ── When does MFE "start"? ────────────────────────────────────────────
-        # First hour where price moves meaningfully in MFE direction (> 5p)
         if use_direction and not np.isnan(direction):
-            dir_int = int(direction)
+            dir_int   = int(direction)
             cum_moves = dir_int * (closes - entry_price) / pip
             start_idx = next((i for i, v in enumerate(cum_moves) if v > 5), t_mfe_val)
         else:
-            start_idx = t_mfe_val  # fallback
+            start_idx = t_mfe_val
 
         # ── MFE duration: from start to peak ─────────────────────────────────
         mfe_duration = t_mfe_val - start_idx if t_mfe_val >= start_idx else 0
@@ -264,8 +259,8 @@ def analyse_signals(df_sig, label, use_direction=False):
             'correct':       correct,
             'mfe':           mfe_val,
             'mae':           mae_val,
-            'mfe_long':      mfe_long,
-            'mfe_short':     mfe_short,
+            'mfe_long':      move_up,
+            'mfe_short':     move_down,
             't_mfe':         t_mfe_val,
             't_mae':         t_mae_val,
             't_mfe_start':   start_idx,
@@ -297,7 +292,7 @@ def p(x, d=1): return f'{x:+.{d}f}p' if not np.isnan(x) else 'n/a'
 def f(x, d=1): return f'{x:.{d}f}' if not np.isnan(x) else 'n/a'
 
 print(f'\n\n{SEP}')
-print(f'  REGIME DEEP DIVE  —  MFE>=50  |  hours 7-20 UTC  |  72h cooldown')
+print(f'  REGIME DEEP DIVE  —  MFE>=30  |  hours 7-20 UTC  |  8h cooldown  |  8h window')
 print(f'  Period: {START_DATE} to present  |  last 18 months')
 print(f'{SEP}')
 
@@ -311,7 +306,7 @@ print(f'{SEP}')
 # MFE-only: accuracy of fwd_72h > 0 (does price go up more than it went down)
 ana_mfe['correct_long']  = (ana_mfe['fwd_72h'] > 0).astype(float)
 ana_mfe['correct_short'] = (ana_mfe['fwd_72h'] < 0).astype(float)
-print(f'\n  MFE>=50 alone  (N={len(ana_mfe):,}, {len(ana_mfe)/months_mfe:.0f}/mo):')
+print(f'\n  MFE>=30 alone  (N={len(ana_mfe):,}, {len(ana_mfe)/months_mfe:.0f}/mo):')
 print(f'    fwd_72h > 0  (bullish): {pct(ana_mfe["correct_long"].mean())}   avg={p(ana_mfe[ana_mfe["fwd_72h"]>0]["fwd_72h"].mean())}')
 print(f'    fwd_72h < 0  (bearish): {pct(ana_mfe["correct_short"].mean())}   avg={p(ana_mfe[ana_mfe["fwd_72h"]<0]["fwd_72h"].mean())}')
 print(f'    avg |fwd_72h|: {p(ana_mfe["fwd_72h"].abs().mean())}')
@@ -319,7 +314,7 @@ print(f'    avg MFE (best seen):    {p(ana_mfe["mfe"].mean())}  med={p(ana_mfe["
 print(f'    avg MAE (worst seen):   {p(ana_mfe["mae"].mean())}  med={p(ana_mfe["mae"].median())}')
 print(f'    avg MFE/MAE ratio:      {f(ana_mfe["mfe_mae_ratio"].mean())}')
 
-print(f'\n  MFE>=50 + Direction  (N={len(ana_dir):,}, {len(ana_dir)/months_dir:.0f}/mo):')
+print(f'\n  MFE>=30 + Direction  (N={len(ana_dir):,}, {len(ana_dir)/months_dir:.0f}/mo):')
 print(f'    Directional accuracy:   {pct(ana_dir["correct"].mean())}')
 print(f'    avg fwd_72h in dir:     {p(ana_dir["fwd_signed"].mean())}  med={p(ana_dir["fwd_signed"].median())}')
 print(f'    avg MFE (in dir):       {p(ana_dir["mfe"].mean())}  med={p(ana_dir["mfe"].median())}')
@@ -466,6 +461,13 @@ for d in range(5):
     print(f'    {days[d]}: N={len(sub):>4}  acc={pct(sub["correct"].mean())}  '
           f'avg={p(sub["fwd_signed"].mean())}  MFE={p(sub["mfe"].mean())}  MAE={p(sub["mae"].mean())}')
 
+print(f'\n  By hour of day (MFE+Direction):')
+for h in range(24):
+    sub = ana_dir[ana_dir['hour'] == h]
+    if len(sub) < 5: continue
+    print(f'    h{h:02d}: N={len(sub):>4}  acc={pct(sub["correct"].mean())}  '
+          f'avg={p(sub["fwd_signed"].mean())}  MFE={p(sub["mfe"].mean())}  MAE={p(sub["mae"].mean())}')
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 8: Monthly stability
 # ─────────────────────────────────────────────────────────────────────────────
@@ -487,7 +489,7 @@ print(f'\n{SEP}')
 print(f'  9. MFE SCORE vs ACCURACY  (does higher score = better outcome?)')
 print(f'{SEP}')
 print(f'\n  MFE+Direction:')
-bins = [(50,60),(60,70),(70,80),(80,90),(90,110),(110,130),(130,999)]
+bins = [(30,40),(40,50),(50,60),(60,70),(70,80),(80,90),(90,110),(110,130),(130,999)]
 for lo, hi in bins:
     sub = ana_dir[(ana_dir['mfe_score'] >= lo) & (ana_dir['mfe_score'] < hi)]
     if len(sub) < 5: continue

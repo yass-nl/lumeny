@@ -1,12 +1,12 @@
 """
-Model inference v7.0 — MFE Q50 LightGBM quantile model + rule-based direction system.
+Model inference v8.0 — MFE Q50 LightGBM quantile model + rule-based direction system.
 
-The MFE model predicts the dominant move (max of up/down excursion) over 72h,
+The MFE model predicts the dominant move (max of up/down excursion) over 8h,
 completely direction-agnostic.  Direction is determined separately by pair-specific
 rule-based thresholds applied on top.
 
 Two outputs per bar:
-  - is_signal : mfe_q50_pips >= MFE_THRESH (70 pips)
+  - is_signal : mfe_q50_pips >= MFE_THRESH (30 pips)
   - direction : +1 LONG / -1 SHORT / NaN if rule has no clear call for this bar
 
 Both are logged regardless — dashboard shows all signals, direction-unconfirmed too.
@@ -18,7 +18,7 @@ import pandas as pd
 from pathlib import Path
 
 MODELS_DIR = Path("/app/models")
-MFE_THRESH = 70.0   # pips (model output is already in pips)
+MFE_THRESH = 30.0   # pips (model output is already in pips)
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +187,7 @@ class Predictor:
         return {
             'pair':            pair,
             'mfe_q50_pips':    round(mfe_pips, 1),
-            'is_signal':       mfe_pips >= MFE_THRESH,
+            'is_signal':       bool(mfe_pips >= MFE_THRESH),
             'direction':       dir_int,
             'direction_label': dir_label,
         }

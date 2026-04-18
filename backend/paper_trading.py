@@ -1,7 +1,7 @@
 """
-LumenY -- Signal Tracker v7.0
+LumenY -- Signal Tracker v8.0
 
-MFE model (Q50 >= 70 pips) + rule-based direction system.
+MFE model (Q50 >= 30 pips, 8h horizon) + rule-based direction system.
 Informational system: fires when a big move is likely, tells direction.
 No automated order execution.
 
@@ -57,14 +57,13 @@ logger = logging.getLogger(__name__)
 # -- Constants --
 
 # MFE signal threshold (pips)
-MFE_THRESH = 70.0
+MFE_THRESH = 30.0
 
+# Cooldown: once a signal fires for a pair, skip it for 8 trading hours
+COOLDOWN_HOURS = 8
 
-# Cooldown: once a signal fires for a pair, skip it for 72 trading hours
-COOLDOWN_HOURS = 72
-
-# Maturity: resolve 72h after signal bar closes + 1h buffer
-MATURITY_HOURS = 73
+# Maturity: resolve 8h after signal bar closes + 1h buffer
+MATURITY_HOURS = 9
 
 # Email config (Gmail SMTP) — set via environment variables
 EMAIL_FROM     = os.environ.get('EMAIL_FROM', '')
@@ -477,10 +476,10 @@ async def _fetch_1h_bars(pair: str, from_dt: datetime, to_dt: datetime) -> list:
 async def resolve_outcomes():
     """
     Find signals that have matured and compute actual outcomes:
-      - actual_mfe_pips : max(up_move, down_move) over the 72h window
-      - actual_mae_pips : min(up_move, down_move) over the 72h window
-      - fwd_72h_pips    : price at T+72h minus entry (signed)
-      - correct         : 1 if direction matches fwd_72h sign, else 0 (NULL if no direction)
+      - actual_mfe_pips : max(up_move, down_move) over the 8h window
+      - actual_mae_pips : min(up_move, down_move) over the 8h window
+      - fwd_72h_pips    : price at T+8h minus entry (signed, column name kept for DB compat)
+      - correct         : 1 if direction matches fwd_8h sign, else 0 (NULL if no direction)
     """
     from features import PIP_SIZE
 
@@ -522,7 +521,7 @@ async def resolve_outcomes():
             if logged_at.tzinfo is None:
                 logged_at = logged_at.replace(tzinfo=timezone.utc)
 
-            # Fetch ~75h of 1H bars starting from signal bar
+            # Fetch ~12h of 1H bars starting from signal bar
             bars = await _fetch_1h_bars(
                 pair,
                 logged_at - timedelta(hours=2),
@@ -551,8 +550,8 @@ async def resolve_outcomes():
             if entry_idx is None:
                 continue
 
-            # Window: next 72 bars (hours) after entry
-            window_end_idx = min(entry_idx + 72, len(bars) - 1)
+            # Window: next 8 bars (hours) after entry
+            window_end_idx = min(entry_idx + 8, len(bars) - 1)
             if window_end_idx <= entry_idx:
                 continue
 
